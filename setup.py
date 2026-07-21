@@ -16,6 +16,6 @@ setup(
             "slam_toolbox=slam_toolbox.cli:main",
         ],
     },
-    author="Lenovo",
+    author="FineNav",
     description="A Python CLI tool for interactive SLAM map processing.",
 )
