@@ -1,10 +1,5 @@
 """
-ERASOR2 动态障碍物去除模块
-
-流程:
-  1. 将 frame/ 中的 PCD + .odom 转换为 KITTI 格式
-  2. 生成 ERASOR2 YAML 配置
-  3. 通过 Docker 运行 ERASOR2，输出去除动态障碍物后的静态地图 PCD
+ERASOR2 + Removert 动态障碍物去除模块
 """
 
 import os
@@ -18,6 +13,20 @@ import questionary
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
 
 from .extractor import _read_pcd, _write_pcd, _invert_transform
+
+# ---------------------------------------------------------------------------
+# Docker 镜像（自包含，无需挂载主机文件）
+# ---------------------------------------------------------------------------
+
+_ERASOR2_IMAGE = "stevenmhy/slamtoolbox-erasor2:latest"
+_REMOVERT_IMAGE = "stevenmhy/slamtoolbox-removert:latest"
+
+# 容器内固定路径
+_ERASOR2_BIN_DIR = "/opt/erasor2/bin"
+_ERASOR2_SCRIPTS_DIR = "/opt/erasor2/scripts"
+_REMOVERT_WS = "/opt/removert_ws"
+
+_PKG_DIR = Path(__file__).resolve().parent  # slam_toolbox/
 
 # ---------------------------------------------------------------------------
 # ERASOR2 SemanticKITTILoader 补偿矩阵（来自上游 convert_ros2bag_to_erasor2_kitti.py）
@@ -239,44 +248,9 @@ rerun:
 # ---------------------------------------------------------------------------
 
 def run_erasor2_docker(kitti_root, output_dir, config_path, frame_count):
-    """通过 Docker 运行 ERASOR2。"""
+    """通过 Docker 运行 ERASOR2（二进制和脚本均在镜像内）。"""
 
-    erasor2_root = os.path.expanduser("~/ERASOR2_RemoverT_Workspace/ERASOR2")
-    if not os.path.isdir(erasor2_root):
-        raise RuntimeError(
-            f"ERASOR2 源码目录不存在: {erasor2_root}\n"
-            "请确认 ~/ERASOR2_RemoverT_Workspace/ERASOR2 已 clone 并编译。"
-        )
-
-    # 检查/拉取镜像
-    image = "stevenmhy/erasor2:ubuntu22"
-    local_check = subprocess.run(
-        ["docker", "image", "inspect", image],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    if local_check.returncode != 0:
-        # 也检查不带 registry 前缀的本地 tag
-        local_fallback = subprocess.run(
-            ["docker", "image", "inspect", "erasor2:ubuntu22"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        if local_fallback.returncode == 0:
-            image = "erasor2:ubuntu22"
-            print(f"使用本地镜像: {image}")
-        else:
-            print(f"本地未找到镜像，正在从 Docker Hub 拉取 {image}...")
-            subprocess.run(["docker", "pull", image], check=True)
-    else:
-        print(f"本地已有镜像: {image}")
-
-    # 检查 build_safe 二进制
-    mapgen_bin = os.path.join(erasor2_root, "build_safe", "mapgen")
-    erasor2_bin = os.path.join(erasor2_root, "build_safe", "run_erasor2")
-    kitti_clustering = os.path.join(erasor2_root, "scripts", "kitti_clustering.py")
-
-    for p in [mapgen_bin, erasor2_bin, kitti_clustering]:
-        if not os.path.exists(p):
-            raise RuntimeError(f"ERASOR2 缺少文件: {p}")
+    image = _ensure_or_pull_image(_ERASOR2_IMAGE)
 
     docker_cmd = [
         "docker", "run", "--rm",
@@ -284,22 +258,21 @@ def run_erasor2_docker(kitti_root, output_dir, config_path, frame_count):
         "--cpus=4",
         "-u", f"{os.getuid()}:{os.getgid()}",
         "-e", "HOME=/tmp",
-        "-v", f"{erasor2_root}:{erasor2_root}",
         "-v", f"{kitti_root}:{kitti_root}",
         "-v", f"{output_dir}:{output_dir}",
-        "-w", erasor2_root,
+        "-w", _ERASOR2_SCRIPTS_DIR,
         image,
         "bash", "-lc",
         "set -euo pipefail; "
-        f"python3 scripts/kitti_clustering.py "
+        f"python3 {_ERASOR2_SCRIPTS_DIR}/kitti_clustering.py "
         f"  --kitti_dir {kitti_root} "
         f"  --seq 00 "
         f"  --init_stamp 0 "
         f"  --end_stamp {frame_count - 1} "
         f"  --save-instance-labels "
         f"  --save-ground-labels; "
-        f"{erasor2_root}/build_safe/mapgen {config_path}; "
-        f"{erasor2_root}/build_safe/run_erasor2 {config_path}",
+        f"{_ERASOR2_BIN_DIR}/mapgen {config_path}; "
+        f"{_ERASOR2_BIN_DIR}/run_erasor2 {config_path}",
     ]
 
     print("正在 Docker 容器中运行 ERASOR2（可能需要数分钟）...")
@@ -558,11 +531,8 @@ def start_removert(map_path):
     Path(params_path).write_text(params_text)
     print(f"配置文件已生成: {params_path}")
 
-    # ---- Docker 运行 ----
-    image = _ensure_or_pull_image("stevenmhy/removert:latest", "osrf/ros:noetic-desktop-full")
-    removert_ws = os.path.expanduser("~/ERASOR2_RemoverT_Workspace/removert")
-    if not os.path.isdir(removert_ws):
-        raise RuntimeError(f"Removert workspace 不存在: {removert_ws}")
+    # ---- Docker 运行（workspace 已预编译在镜像内）----
+    image = _ensure_or_pull_image(_REMOVERT_IMAGE)
 
     print("正在 Docker 容器中运行 Removert（可能需要数分钟）...")
     print(f"输出目录: {output_dir}")
@@ -572,16 +542,14 @@ def start_removert(map_path):
         "--memory=8g", "--cpus=4",
         "-u", f"{os.getuid()}:{os.getgid()}",
         "-e", "HOME=/tmp",
-        "-v", f"{removert_ws}:/tmp/removert_ws",
         "-v", f"{kitti_root}:{kitti_root}:ro",
         "-v", f"{output_dir}:{output_dir}",
-        "-w", "/tmp/removert_ws",
+        "-w", _REMOVERT_WS,
         image,
         "bash", "-lc",
         "set -euo pipefail; "
         "source /opt/ros/noetic/setup.bash; "
-        "catkin_make -j1 2>&1 | tail -5; "
-        "source devel/setup.bash; "
+        "source /opt/removert_ws/devel/setup.bash; "
         "roscore >/tmp/roscore.log 2>&1 & "
         "ROSCORE_PID=$!; "
         "trap 'kill $ROSCORE_PID 2>/dev/null' EXIT; "
