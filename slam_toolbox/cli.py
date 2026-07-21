@@ -72,6 +72,7 @@ def main():
                     "2. Frame Extractor (帧提取)",
                     "3. Map Builder (点云地图构建)",
                     "4. ERASOR2 (动态障碍物去除)",
+                    "5. Removert (动态障碍物去除)",
                     "返回上一级"
                 ]
             ).ask()
@@ -86,8 +87,11 @@ def main():
                 from .builder import start_building
                 start_building(map_path)
             elif "4. ERASOR2" in sub_action:
-                from .erasor2 import start_erasor2
+                from .dynamic_removal import start_erasor2
                 start_erasor2(map_path)
+            elif "5. Removert" in sub_action:
+                from .dynamic_removal import start_removert
+                start_removert(map_path)
 
         elif action == "2. 2D Map":
             sub_action = questionary.select(

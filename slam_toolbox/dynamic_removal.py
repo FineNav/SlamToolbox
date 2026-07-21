@@ -410,3 +410,228 @@ def start_erasor2(map_path):
         print(f"\n[yellow]ERASOR2 仅生成了原始地图，未找到 estimated 结果。[/yellow]")
         print(f"  原始地图: {output_before}")
         print(f"  输出目录: {output_dir}/")
+
+
+# ---------------------------------------------------------------------------
+# Removert 动态障碍物去除
+# ---------------------------------------------------------------------------
+
+def _ensure_kitti_dataset(map_path):
+    """确保 KITTI 数据集存在：复用已有 eraser2_dataset 或从 frame 转换。"""
+    kitti_root = os.path.join(map_path, "erasor2_dataset")
+    seq_dir = os.path.join(kitti_root, "dataset", "sequences", "00")
+    velodyne_dir = os.path.join(seq_dir, "velodyne")
+
+    if os.path.isdir(velodyne_dir) and os.listdir(velodyne_dir):
+        # 已有数据，复用
+        bin_files = [f for f in os.listdir(velodyne_dir) if f.endswith(".bin")]
+        frame_count = len(bin_files)
+        print(f"复用已有 KITTI 数据集: {velodyne_dir} ({frame_count} 帧)")
+        return kitti_root, frame_count
+
+    # 需要转换
+    print("KITTI 数据集不存在，先转换帧...")
+    return convert_frames_to_kitti(map_path)
+
+
+def _ensure_or_pull_image(image, fallback=None):
+    """检查 Docker 镜像是否存在，否则拉取。返回实际的 image tag。"""
+    local = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    if local.returncode == 0:
+        print(f"本地已有镜像: {image}")
+        return image
+
+    if fallback:
+        local2 = subprocess.run(
+            ["docker", "image", "inspect", fallback],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if local2.returncode == 0:
+            print(f"使用本地镜像: {fallback}")
+            return fallback
+
+    print(f"本地未找到镜像，正在从 Docker Hub 拉取 {image}...")
+    subprocess.run(["docker", "pull", image], check=True)
+    return image
+
+
+def start_removert(map_path):
+    """Removert 动态障碍物去除主流程。"""
+
+    frame_dir = os.path.join(map_path, "frame")
+    if not os.path.isdir(frame_dir):
+        print(f"帧目录 {frame_dir} 不存在。")
+        run_extractor = questionary.confirm(
+            "是否先运行 Frame Extractor 提取点云帧？", default=True
+        ).ask()
+        if run_extractor:
+            from .extractor import start_extraction
+            start_extraction(map_path)
+        else:
+            return
+        if not os.path.isdir(frame_dir):
+            print("Frame Extractor 未能生成帧目录，退出。")
+            return
+
+    kitti_root, frame_count = _ensure_kitti_dataset(map_path)
+
+    # 配置
+    scan_dir = os.path.join(kitti_root, "dataset", "sequences", "00", "velodyne")
+    pose_path = os.path.join(kitti_root, "dataset", "sequences", "00", "poses_odom_base.txt")
+    if not os.path.exists(pose_path):
+        pose_path = os.path.join(kitti_root, "dataset", "sequences", "00", "poses_suma_optim.txt")
+
+    print(f"\n检测到 {frame_count} 帧，准备运行 Removert 动态障碍物去除。\n")
+
+    vfov_str = questionary.text("垂直 FOV (度):", default="50").ask()
+    hfov_str = questionary.text("水平 FOV (度):", default="360").ask()
+    batch_str = questionary.text("批处理大小:", default="150").ask()
+    omp_str = questionary.text("OpenMP 核心数:", default="4").ask()
+
+    try:
+        vfov = float(vfov_str)
+    except ValueError:
+        vfov = 50
+    try:
+        hfov = float(hfov_str)
+    except ValueError:
+        hfov = 360
+    try:
+        batch_size = int(batch_str)
+    except ValueError:
+        batch_size = 150
+    try:
+        omp_cores = int(omp_str)
+    except ValueError:
+        omp_cores = 4
+
+    # 输出目录
+    output_dir = os.path.join(map_path, "removert_output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 生成配置文件
+    params_text = f"""removert:
+  isScanFileKITTIFormat: true
+
+  saveMapPCD: true
+  saveCleanScansPCD: false
+  save_pcd_directory: "{output_dir}"
+
+  sequence_scan_dir: "{scan_dir}"
+  sequence_pose_path: "{pose_path}"
+
+  sequence_vfov: {vfov}
+  sequence_hfov: {hfov}
+
+  ExtrinsicLiDARtoPoseBase: [1.0, 0.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0, 0.0,
+                             0.0, 0.0, 1.0, 0.0,
+                             0.0, 0.0, 0.0, 1.0]
+
+  use_keyframe_gap: true
+  keyframe_gap: 1
+
+  start_idx: 0
+  end_idx: {frame_count - 1}
+
+  clean_for_all_scan: false
+  batch_size: {batch_size}
+  valid_ratio_to_save: 0.75
+
+  remove_resolution_list: [2.5, 2.0, 1.5]
+  revert_resolution_list: [1.0, 0.9, 0.8, 0.7]
+
+  downsample_voxel_size: 0.0
+
+  num_nn_points_within: 2
+  dist_nn_points_within: 0.1
+
+  num_omp_cores: {omp_cores}
+
+  rimg_color_min: 0.0
+  rimg_color_max: 20.0
+"""
+    params_path = os.path.join(output_dir, "removert_params.yaml")
+    Path(params_path).write_text(params_text)
+    print(f"配置文件已生成: {params_path}")
+
+    # ---- Docker 运行 ----
+    image = _ensure_or_pull_image("stevenmhy/removert:latest", "osrf/ros:noetic-desktop-full")
+    removert_ws = os.path.expanduser("~/ERASOR2_RemoverT_Workspace/removert")
+    if not os.path.isdir(removert_ws):
+        raise RuntimeError(f"Removert workspace 不存在: {removert_ws}")
+
+    print("正在 Docker 容器中运行 Removert（可能需要数分钟）...")
+    print(f"输出目录: {output_dir}")
+
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "--memory=8g", "--cpus=4",
+        "-u", f"{os.getuid()}:{os.getgid()}",
+        "-e", "HOME=/tmp",
+        "-v", f"{removert_ws}:/tmp/removert_ws",
+        "-v", f"{kitti_root}:{kitti_root}:ro",
+        "-v", f"{output_dir}:{output_dir}",
+        "-w", "/tmp/removert_ws",
+        image,
+        "bash", "-lc",
+        "set -euo pipefail; "
+        "source /opt/ros/noetic/setup.bash; "
+        "catkin_make -j1 2>&1 | tail -5; "
+        "source devel/setup.bash; "
+        "roscore >/tmp/roscore.log 2>&1 & "
+        "ROSCORE_PID=$!; "
+        "trap 'kill $ROSCORE_PID 2>/dev/null' EXIT; "
+        "for i in $(seq 1 30); do "
+        "  if rosparam list >/dev/null 2>&1; then break; fi; "
+        "  sleep 1; "
+        "done; "
+        f"rosparam load {params_path}; "
+        "rosrun removert removert_removert",
+    ]
+
+    result = subprocess.run(docker_cmd, check=False)
+    if result.returncode != 0:
+        print(f"[yellow]Docker 返回非零退出码: {result.returncode}，请检查上方日志[/yellow]")
+
+    # ---- 复制结果 ----
+    import glob
+    import shutil
+
+    map_dir_local = os.path.join(map_path, "map")
+    os.makedirs(map_dir_local, exist_ok=True)
+
+    # Removert outputs (通常 6 个 PCD):
+    #   removert_before.pcd / _local.pcd
+    #   removert_after.pcd  / _local.pcd
+    #   removert_dynamic.pcd / _local.pcd
+    after_pcd = os.path.join(output_dir, "removert_after.pcd")
+    after_local_pcd = os.path.join(output_dir, "removert_after_local.pcd")
+    before_pcd = os.path.join(output_dir, "removert_before.pcd")
+    dynamic_pcd = os.path.join(output_dir, "removert_dynamic.pcd")
+
+    copied = []
+    if os.path.exists(after_pcd):
+        shutil.copy2(after_pcd, os.path.join(map_dir_local, "map_removert_static.pcd"))
+        copied.append("removert_after (全局静态地图)")
+    if os.path.exists(after_local_pcd):
+        shutil.copy2(after_local_pcd, os.path.join(map_dir_local, "map_removert_static_local.pcd"))
+        copied.append("removert_after_local (局部静态地图)")
+    if os.path.exists(before_pcd):
+        shutil.copy2(before_pcd, os.path.join(map_dir_local, "map_removert_before.pcd"))
+        copied.append("removert_before (原始地图)")
+    if os.path.exists(dynamic_pcd):
+        shutil.copy2(dynamic_pcd, os.path.join(map_dir_local, "map_removert_dynamic.pcd"))
+        copied.append("removert_dynamic (动态点云)")
+
+    if copied:
+        print(f"\n[bold green]Removert 处理完成！[/bold green]")
+        for name in copied:
+            print(f"  ✓ {name}")
+        print(f"  完整输出目录: {output_dir}/")
+    else:
+        print(f"\n[yellow]未找到 Removert 输出文件，请检查 Docker 日志。[/yellow]")
+        print(f"  输出目录: {output_dir}/")
