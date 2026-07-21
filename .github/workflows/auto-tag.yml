@@ -1,4 +1,4 @@
-name: Auto Tag on Version Change
+name: Auto Tag and Publish
 
 on:
   push:
@@ -12,13 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag_created: ${{ steps.create_tag.outputs.created }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # 使用 PAT 而非 GITHUB_TOKEN，这样 tag push 能触发 publish.yml
-          token: ${{ secrets.TAG_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Extract version from setup.py
         id: version
@@ -27,21 +26,45 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
-      - name: Check if tag already exists
-        id: check_tag
+      - name: Check and create tag
+        id: create_tag
         run: |
           TAG="v${{ steps.version.outputs.version }}"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
             echo "Tag $TAG already exists, skipping."
+            echo "created=false" >> $GITHUB_OUTPUT
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Tag $TAG does not exist, will create."
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Tag $TAG created and pushed."
+            echo "created=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create and push tag
-        if: steps.check_tag.outputs.exists == 'false'
+  publish:
+    needs: auto-tag
+    if: needs.auto-tag.outputs.tag_created == 'true'
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install build dependencies
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
-          git tag "$TAG"
-          git push origin "$TAG"
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build binary wheel and source tarball
+        run: python -m build
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
