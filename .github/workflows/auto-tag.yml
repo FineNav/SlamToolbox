@@ -23,7 +23,7 @@ jobs:
       - name: Extract version from setup.py
         id: version
         run: |
-          VERSION=$(python -c "exec(open('setup.py').read()); print(version)")
+          VERSION=$(grep -Po 'version\s*=\s*"\K[^"]*' setup.py)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
