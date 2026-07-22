@@ -191,8 +191,10 @@ def start_interactive_slam(map_path):
             "[bold]阶段 1/3: odometry2graph[/bold]\n\n"
             "即将自动启动 Interactive SLAM GUI (odometry2graph)。\n\n"
             "在 GUI 中操作:\n"
-            f"  打开 [bold cyan]/Map/frame/[/bold cyan] 加载 odometry 数据\n"
-            f"  保存为 interactive_slam 格式到 [bold yellow]/Map/interactive_slam/original/[/bold yellow]\n\n"
+            f"  1. [bold cyan]File → Open → ROS[/bold cyan]\n"
+            f"     选择 [bold yellow]/Map/frame/[/bold yellow] 目录加载 odometry 数据\n"
+            f"  2. [bold cyan]File → Save[/bold cyan]\n"
+            f"     保存到 [bold yellow]/Map/interactive_slam/original/[/bold yellow]\n\n"
             "关闭 GUI 窗口后容器将自动退出。",
             title="Interactive SLAM",
             border_style="cyan",
@@ -226,8 +228,10 @@ def start_interactive_slam(map_path):
             "[bold]阶段 2/3: interactive_slam[/bold]\n\n"
             "即将自动启动 Interactive SLAM GUI (interactive_slam)。\n\n"
             "在 GUI 中操作:\n"
-            f"  打开 [bold cyan]/Map/interactive_slam/original/[/bold cyan] 加载图数据\n"
-            f"  优化结果保存到 [bold yellow]/Map/interactive_slam/corrected/[/bold yellow]\n\n"
+            f"  1. [bold cyan]File → Open → New Map[/bold cyan]\n"
+            f"     选择 [bold yellow]/Map/interactive_slam/original/[/bold yellow] 加载图数据\n"
+            f"  2. [bold cyan]File → Save → Save map data[/bold cyan]\n"
+            f"     优化结果保存到 [bold yellow]/Map/interactive_slam/corrected/[/bold yellow]\n\n"
             "关闭 GUI 窗口后容器将自动退出。",
             title="Interactive SLAM",
             border_style="cyan",
