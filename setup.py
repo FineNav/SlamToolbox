@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="slam_toolbox",
-    version="0.1.6",
+    version="0.1.7",
     packages=find_packages(),
     install_requires=[
         "questionary>=2.0.0",
@@ -10,6 +10,7 @@ setup(
         "open3d>=0.15.0",
         "pyyaml>=6.0",
         "rich>=12.0.0",
+        "scipy>=1.7.0",
     ],
     entry_points={
         "console_scripts": [

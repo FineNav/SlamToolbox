@@ -159,7 +159,7 @@ def main():
                         title=[("bold ansiyellow", "数据获取")],
                         disabled="section",
                     ),
-                    "   1. 录制 Rosbag",
+                    "   1. 录制 rosbag",
                     Choice(
                         title=[("bold ansiyellow", "帧构建")],
                         disabled="section",
@@ -170,7 +170,7 @@ def main():
                         disabled="section",
                     ),
                     "   3. 强制平面约束",
-                    "   4. Interactive SLAM [占位]",
+                    "   4. Interactive SLAM",
                     Choice(
                         title=[("bold ansiyellow", "动态障碍物清除")],
                         disabled="section",
