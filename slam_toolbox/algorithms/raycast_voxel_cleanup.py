@@ -44,6 +44,7 @@ class OctreeMap:
         self.min_log_odds = min_log_odds
         self.max_log_odds = max_log_odds
         self.leaf_count = 0
+        self._leaves_by_coord: dict[tuple[int, int, int], OctreeNode] = {}
 
     @staticmethod
     def _contains(node: OctreeNode, coord: tuple[int, int, int]) -> bool:
@@ -79,6 +80,10 @@ class OctreeMap:
             self.root = new_root
 
     def get_or_create_leaf(self, coord: tuple[int, int, int]) -> OctreeNode:
+        existing = self._leaves_by_coord.get(coord)
+        if existing is not None:
+            return existing
+
         self._ensure_contains(coord)
         assert self.root is not None
         node = self.root
@@ -101,24 +106,11 @@ class OctreeMap:
             node = child
         if self.leaf_count == 0 and self.root is node:
             self.leaf_count = 1
+        self._leaves_by_coord[coord] = node
         return node
 
     def get_leaf(self, coord: tuple[int, int, int]) -> OctreeNode | None:
-        node = self.root
-        if node is None or not self._contains(node, coord):
-            return None
-        while node.size > 1:
-            if node.children is None:
-                return None
-            half = node.size // 2
-            ox, oy, oz = node.origin
-            ix = 1 if coord[0] >= ox + half else 0
-            iy = 1 if coord[1] >= oy + half else 0
-            iz = 1 if coord[2] >= oz + half else 0
-            node = node.children[ix | (iy << 1) | (iz << 2)]
-            if node is None:
-                return None
-        return node
+        return self._leaves_by_coord.get(coord)
 
     def update_hit(self, coord: tuple[int, int, int], count: int, hit_log_odds: float) -> None:
         leaf = self.get_or_create_leaf(coord)
@@ -149,22 +141,21 @@ class OctreeMap:
         return count
 
     def count_occupied(self, min_hit_frames: int, occupied_threshold: float) -> int:
-        count = 0
-        for leaf in self.iter_leaves():
-            if leaf.hit_frames >= min_hit_frames and leaf.log_odds >= occupied_threshold:
-                count += 1
-        return count
+        return len(self.occupied_coords(min_hit_frames, occupied_threshold))
+
+    def occupied_coords(
+        self,
+        min_hit_frames: int,
+        occupied_threshold: float,
+    ) -> set[tuple[int, int, int]]:
+        return {
+            coord
+            for coord, leaf in self._leaves_by_coord.items()
+            if leaf.hit_frames >= min_hit_frames and leaf.log_odds >= occupied_threshold
+        }
 
     def iter_leaves(self):
-        if self.root is None:
-            return
-        stack = [self.root]
-        while stack:
-            node = stack.pop()
-            if node.size == 1:
-                yield node
-            elif node.children is not None:
-                stack.extend(child for child in node.children if child is not None)
+        yield from self._leaves_by_coord.values()
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,6 +175,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--voxel-size", type=float, default=0.30)
     p.add_argument("--max-range", type=float, default=35.0, help="Horizontal range in local frame; 0 disables.")
     p.add_argument("--body-radius", type=float, default=0.8, help="Drop points near the vehicle in local xy; 0 disables.")
+    p.add_argument("--local-z-min", type=float, default=None, help="Only points within this local z ROI can be removed as dynamic.")
+    p.add_argument("--local-z-max", type=float, default=None, help="Only points within this local z ROI can be removed as dynamic.")
     p.add_argument(
         "--ground-protect-local-z-max",
         type=float,
@@ -257,6 +250,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--shuffle-seed", type=int, default=0, help="Random seed for --shuffle-after.")
     p.add_argument("--write-before", action="store_true", help="Also write raycast_before.pcd.")
+    p.add_argument(
+        "--save-dynamic-frames",
+        action="store_true",
+        help="Also write per-frame removed point clouds under <out>/dynamic_frames for GIF visualization.",
+    )
     p.add_argument("--progress-interval", type=int, default=20)
     return p.parse_args()
 
@@ -278,7 +276,15 @@ def load_poses(path: Path) -> list[np.ndarray]:
     return poses
 
 
-def transform_scan(scan_path: Path, pose: np.ndarray, body_radius: float, max_range: float) -> tuple[np.ndarray, np.ndarray]:
+def transform_scan(
+    scan_path: Path,
+    pose: np.ndarray,
+    body_radius: float,
+    max_range: float,
+    local_z_min: float | None,
+    local_z_max: float | None,
+    apply_local_z: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
     scan = np.fromfile(scan_path, dtype=np.float32).reshape(-1, 4)
     scan = scan[np.isfinite(scan).all(axis=1)]
     if scan.size == 0:
@@ -289,6 +295,11 @@ def transform_scan(scan_path: Path, pose: np.ndarray, body_radius: float, max_ra
         keep &= dist2 >= body_radius * body_radius
     if max_range > 0:
         keep &= dist2 <= max_range * max_range
+    if apply_local_z:
+        if local_z_min is not None:
+            keep &= scan[:, 2] >= local_z_min
+        if local_z_max is not None:
+            keep &= scan[:, 2] <= local_z_max
     scan = scan[keep]
     if scan.size == 0:
         return scan, scan
@@ -321,7 +332,14 @@ def ray_free_coords(
         samples = max(1, int(math.floor(usable / step)))
         ts = (np.arange(1, samples + 1, dtype=np.float64) * step) / dist
         pts = origin[None, :] + ts[:, None] * vec[None, :]
-        coords = np.unique(voxel_coords_for_points(pts, voxel_size), axis=0)
+        coords = voxel_coords_for_points(pts, voxel_size)
+        if coords.shape[0] > 1:
+            # Along one straight ray, repeated visits to a voxel are contiguous.
+            # Removing adjacent duplicates preserves the voxel set without sorting.
+            keep = np.empty(coords.shape[0], dtype=bool)
+            keep[0] = True
+            keep[1:] = np.any(coords[1:] != coords[:-1], axis=1)
+            coords = coords[keep]
         free.update((int(c[0]), int(c[1]), int(c[2])) for c in coords)
     return free
 
@@ -378,6 +396,14 @@ def write_pcd_from_payload(payload_path: Path, point_count: int, out_path: Path)
     write_pcd_header(out_path, point_count)
     with out_path.open("ab") as dst, payload_path.open("rb") as src:
         shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+
+
+def write_pcd_from_points(points: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    points = points.astype(np.float32, copy=False).reshape(-1, 4)
+    write_pcd_header(out_path, points.shape[0])
+    with out_path.open("ab") as dst:
+        points.tofile(dst)
 
 
 def spatially_sort_payload(
@@ -541,14 +567,23 @@ def main() -> int:
     total_ray_points = 0
     print(
         f"[raycast] dataset={args.dataset} seq={args.seq} frames={args.start}..{end} "
-        f"step={args.stride} pose={pose_path} out={out_dir}",
+        f"step={args.stride} pose={pose_path} out={out_dir} "
+        f"z=[{args.local_z_min}, {args.local_z_max}]",
         flush=True,
     )
 
     for done, frame_id in enumerate(frame_ids, 1):
         pose = poses[frame_id]
         origin = pose[:3, 3].astype(np.float64)
-        cloud, _local_cloud = transform_scan(scan_paths[frame_id], pose, args.body_radius, args.max_range)
+        cloud, _local_cloud = transform_scan(
+            scan_paths[frame_id],
+            pose,
+            args.body_radius,
+            args.max_range,
+            args.local_z_min,
+            args.local_z_max,
+            True,
+        )
         if cloud.size == 0:
             continue
 
@@ -587,7 +622,8 @@ def main() -> int:
                 f"octree_leaves={octree.leaf_count} hit_points={total_hit_points} ray_points={total_ray_points}",
             )
 
-    kept_leaf_count = octree.count_occupied(args.min_hit_frames, args.occupied_threshold)
+    occupied_coords = octree.occupied_coords(args.min_hit_frames, args.occupied_threshold)
+    kept_leaf_count = len(occupied_coords)
     removed_or_free_leaf_count = octree.count_removed_or_free(args.min_miss_frames, args.free_threshold)
 
     after_payload = tmp_dir / "after.payload"
@@ -599,23 +635,35 @@ def main() -> int:
     removed_count = 0
     before_count = 0
     dedup_seen: set = set()
+    dynamic_frames_dir = out_dir / "dynamic_frames"
+    if args.save_dynamic_frames:
+        dynamic_frames_dir.mkdir(parents=True, exist_ok=True)
 
     second_started = time.time()
     with after_payload.open("wb") as after_f, removed_payload.open("wb") as removed_f:
         before_f = before_payload.open("wb") if args.write_before else None
         try:
             for done, frame_id in enumerate(frame_ids, 1):
-                cloud, local_cloud = transform_scan(scan_paths[frame_id], poses[frame_id], args.body_radius, args.max_range)
+                cloud, local_cloud = transform_scan(
+                    scan_paths[frame_id],
+                    poses[frame_id],
+                    args.body_radius,
+                    args.max_range,
+                    args.local_z_min,
+                    args.local_z_max,
+                    False,
+                )
                 if cloud.size == 0:
+                    if args.save_dynamic_frames:
+                        write_pcd_from_points(
+                            np.empty((0, 4), dtype=np.float32),
+                            dynamic_frames_dir / f"{frame_id:06d}.pcd",
+                        )
                     continue
                 coords = voxel_coords_for_points(cloud[:, :3], args.voxel_size)
                 keep_mask = np.fromiter(
                     (
-                        octree.is_occupied(
-                            (int(c[0]), int(c[1]), int(c[2])),
-                            args.min_hit_frames,
-                            args.occupied_threshold,
-                        )
+                        (int(c[0]), int(c[1]), int(c[2])) in occupied_coords
                         for c in coords
                     ),
                     dtype=bool,
@@ -623,6 +671,12 @@ def main() -> int:
                 )
                 if args.ground_protect_local_z_max is not None:
                     keep_mask |= local_cloud[:, 2] <= args.ground_protect_local_z_max
+                outside_roi = np.zeros(local_cloud.shape[0], dtype=bool)
+                if args.local_z_min is not None:
+                    outside_roi |= local_cloud[:, 2] < args.local_z_min
+                if args.local_z_max is not None:
+                    outside_roi |= local_cloud[:, 2] > args.local_z_max
+                keep_mask |= outside_roi
                 kept = cloud[keep_mask]
                 removed = cloud[~keep_mask]
                 if kept.size:
@@ -635,8 +689,11 @@ def main() -> int:
                     after_count += int(kept_dedup.shape[0])
                     deduplicated_after_points += int(kept.shape[0] - kept_dedup.shape[0])
                 if removed.size:
-                    removed.astype(np.float32, copy=False).tofile(removed_f)
+                    removed = removed.astype(np.float32, copy=False)
+                    removed.tofile(removed_f)
                     removed_count += int(removed.shape[0])
+                if args.save_dynamic_frames:
+                    write_pcd_from_points(removed, dynamic_frames_dir / f"{frame_id:06d}.pcd")
                 if before_f is not None:
                     cloud.astype(np.float32, copy=False).tofile(before_f)
                     before_count += int(cloud.shape[0])
@@ -704,6 +761,8 @@ def main() -> int:
         f"voxel_size: {args.voxel_size}",
         f"max_range: {args.max_range}",
         f"body_radius: {args.body_radius}",
+        f"local_z_min: {args.local_z_min}",
+        f"local_z_max: {args.local_z_max}",
         f"ground_protect_local_z_max: {args.ground_protect_local_z_max}",
         f"ray_point_stride: {args.ray_point_stride}",
         f"ray_step_factor: {args.ray_step_factor}",

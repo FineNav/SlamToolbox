@@ -6,8 +6,11 @@ setup(
     packages=find_packages(),
     install_requires=[
         "questionary>=2.0.0",
+        "imageio>=2.31.0",
+        "matplotlib>=3.5.0",
         "numpy>=1.20.0",
         "open3d>=0.15.0",
+        "psutil>=5.9.0",
         "pyyaml>=6.0",
         "rich>=12.0.0",
         "scipy>=1.7.0",

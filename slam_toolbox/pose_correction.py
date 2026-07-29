@@ -7,11 +7,13 @@
 """
 
 import os
-import glob
 import shutil
 import subprocess
+from datetime import datetime
+from pathlib import Path
 import questionary
 import numpy as np
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 
@@ -19,6 +21,70 @@ console = Console()
 
 # Docker 镜像
 INTERACTIVE_SLAM_IMAGE = "stevenmhy/slamtoolbox-interactive_slam:latest"
+
+
+def _is_valid_pose(T):
+    """Return whether *T* is a finite, approximately rigid 4x4 transform."""
+    if not isinstance(T, np.ndarray) or T.shape != (4, 4) or not np.isfinite(T).all():
+        return False
+    if not np.allclose(T[3], [0.0, 0.0, 0.0, 1.0], atol=1e-5):
+        return False
+    R = T[:3, :3]
+    return np.allclose(R.T @ R, np.eye(3), atol=1e-3) and np.isclose(
+        np.linalg.det(R), 1.0, atol=1e-3
+    )
+
+
+def _backup_odom_snapshot(map_path, frame_dir, odom_files, reason):
+    """Create a timestamped, immutable snapshot before destructive pose edits."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = Path(map_path) / "pose_correction" / "backups"
+    backup_dir = root / f"{stamp}_{reason}"
+    suffix = 1
+    while backup_dir.exists():
+        backup_dir = root / f"{stamp}_{reason}_{suffix:02d}"
+        suffix += 1
+    backup_dir.mkdir(parents=True)
+    copied = 0
+    for fname in odom_files:
+        src = Path(frame_dir) / fname
+        if src.is_file():
+            shutil.copy2(src, backup_dir / fname)
+            copied += 1
+    (backup_dir / "backup_metadata.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "reason": reason,
+                "source": str(Path(frame_dir).resolve()),
+                "odom_files": copied,
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return backup_dir
+
+
+def _load_frame_timestamps(frame_dir):
+    """Load ``frame_id -> timestamp_sec`` from frame/timestamps.txt."""
+    path = Path(frame_dir) / "timestamps.txt"
+    if not path.exists():
+        return {}
+    timestamps = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            timestamps[int(parts[0])] = float(parts[1])
+        except ValueError:
+            continue
+    return timestamps
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +165,12 @@ def start_planar_constraint(map_path):
         f"  max |pitch| = {max_abs_pitch:.4f} rad ({np.degrees(max_abs_pitch):.2f}°)"
     )
 
+    if matrices:
+        backup_dir = _backup_odom_snapshot(
+            map_path, frame_dir, sorted(matrices), "before_planar"
+        )
+        console.print(f"[dim]原始位姿快照: {backup_dir}[/dim]")
+
     # 第二遍：施加平面约束
     modified = 0
     for fname, T in matrices.items():
@@ -138,9 +210,33 @@ def _allow_docker_x11():
         console.print("[yellow]警告: 未找到 xhost，Docker GUI 可能无法连接 X11。[/yellow]")
 
 
+def _nvidia_gpu_available():
+    """Return whether the host can expose an NVIDIA GPU to Docker.
+
+    Merely having ``nvidia-smi`` on PATH is not enough: this also performs a
+    short query so that a stale driver installation does not make the GUI
+    launch fail.  ``SLAM_TOOLBOX_DISABLE_GPU=1`` is useful on headless hosts.
+    """
+    if os.environ.get("SLAM_TOOLBOX_DISABLE_GPU", "").lower() in {"1", "true", "yes"}:
+        return False
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        return subprocess.run(
+            ["nvidia-smi", "-L"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _docker_run_cmd(map_path, rosrun_cmd):
-    """构建 docker run 命令，通过 --env 注入 MESA 变量，bash -c 执行 rosrun。"""
+    """构建带 X11 和 GPU 配置的 ``docker run`` 命令。"""
     map_abs = os.path.abspath(map_path)
+    map_root = os.path.dirname(map_abs)
     x11_socket = "/tmp/.X11-unix:/tmp/.X11-unix:rw"
     display = os.environ.get("DISPLAY", ":0")
     xauthority = os.environ.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
@@ -156,12 +252,35 @@ def _docker_run_cmd(map_path, rosrun_cmd):
         "--env", f"DISPLAY={display}",
         "--env", "HOME=/root",
         "--env", "QT_X11_NO_MITSHM=1",
-        "--env", "MESA_GL_VERSION_OVERRIDE=4.5",
-        "--env", "MESA_GLSL_VERSION_OVERRIDE=450",
         "--volume", f"{x11_socket}",
-        "--volume", f"{map_abs}:/Map:rw",
+        # Preserve both the exact host path and convenient container aliases.
+        # Some interactive_slam file dialogs retain absolute paths, so mounting
+        # only at /Map is not sufficient for /home/timory/Map/... selections.
+        "--volume", f"{map_root}:{map_root}:rw",
+        "--volume", f"{map_root}:/Map:rw",
         "--volume", f"{map_abs}:/root/Map:rw",
     ]
+
+    if _nvidia_gpu_available():
+        # --gpus is required for the NVIDIA container runtime to mount the
+        # matching libGLX/libEGL libraries and /dev/nvidia* devices.  Without
+        # it Mesa sees an nvidia-drm driver name but cannot load its DRI file.
+        cmd[2:2] = ["--gpus", "all"]
+        cmd.extend([
+            "--env", "NVIDIA_DRIVER_CAPABILITIES=graphics,utility,display",
+        ])
+    else:
+        # Keep GUI usable on non-NVIDIA machines (or when explicitly disabled)
+        # through the host's DRI device, using Mesa software rendering only as
+        # a last resort when no render device exists.
+        if os.path.exists("/dev/dri"):
+            cmd.extend(["--device", "/dev/dri"])
+        else:
+            cmd.extend([
+                "--env", "LIBGL_ALWAYS_SOFTWARE=1",
+                "--env", "MESA_GL_VERSION_OVERRIDE=4.5",
+                "--env", "MESA_GLSL_VERSION_OVERRIDE=450",
+            ])
     if os.path.exists(xauthority):
         cmd.extend([
             "--env", "XAUTHORITY=/tmp/.docker.xauth",
@@ -180,11 +299,11 @@ def start_interactive_slam(map_path):
 
     阶段 1: odometry2graph
         启动 Docker 容器，用户在 GUI 中操作，将 odom 数据保存为
-        interactive_slam 图格式到 /root/Map/interactive_slam/original/
+        interactive_slam 图格式到当前地图的 interactive_slam/original/
 
     阶段 2: interactive_slam
         再次启动容器，用户在 GUI 中进行 interactive SLAM 优化，
-        结果输出到 /root/Map/interactive_slam/corrected/
+        结果输出到当前地图的 interactive_slam/corrected/
 
     阶段 3: 插值回填
         将稀疏修正位姿通过 Slerp 插值还原为稠密位姿，
@@ -203,6 +322,8 @@ def start_interactive_slam(map_path):
         return
 
     map_abs = os.path.abspath(map_path)
+    map_name = os.path.basename(map_abs)
+    container_map_path = os.path.join(os.path.dirname(map_abs), map_name)
     original_dir = os.path.join(map_path, "interactive_slam", "original")
     corrected_dir = os.path.join(map_path, "interactive_slam", "corrected")
 
@@ -213,9 +334,9 @@ def start_interactive_slam(map_path):
             "即将自动启动 Interactive SLAM GUI (odometry2graph)。\n\n"
             "在 GUI 中操作:\n"
             f"  1. [bold cyan]File → Open → ROS[/bold cyan]\n"
-            f"     选择 [bold yellow]/Map/frame/[/bold yellow] 目录加载 odometry 数据\n"
+            f"     选择 [bold yellow]{container_map_path}/frame/[/bold yellow] 目录加载 odometry 数据\n"
             f"  2. [bold cyan]File → Save[/bold cyan]\n"
-            f"     保存到 [bold yellow]/Map/interactive_slam/original/[/bold yellow]\n\n"
+            f"     保存到 [bold yellow]{container_map_path}/interactive_slam/original/[/bold yellow]\n\n"
             "关闭 GUI 窗口后容器将自动退出。",
             title="Interactive SLAM",
             border_style="cyan",
@@ -238,7 +359,7 @@ def start_interactive_slam(map_path):
     # 检查用户是否保存了数据
     if not os.listdir(original_dir):
         console.print(
-            "[yellow]⚠ 未在 /Map/interactive_slam/original/ 中检测到文件，"
+            f"[yellow]⚠ 未在 {container_map_path}/interactive_slam/original/ 中检测到文件，"
             "请确认已在 GUI 中保存。[/yellow]"
         )
         if not questionary.confirm("是否仍要继续阶段 2？").ask():
@@ -251,9 +372,9 @@ def start_interactive_slam(map_path):
             "即将自动启动 Interactive SLAM GUI (interactive_slam)。\n\n"
             "在 GUI 中操作:\n"
             f"  1. [bold cyan]File → Open → New Map[/bold cyan]\n"
-            f"     选择 [bold yellow]/Map/interactive_slam/original/[/bold yellow] 加载图数据\n"
+            f"     选择 [bold yellow]{container_map_path}/interactive_slam/original/[/bold yellow] 加载图数据\n"
             f"  2. [bold cyan]File → Save → Save map data[/bold cyan]\n"
-            f"     优化结果保存到 [bold yellow]/Map/interactive_slam/corrected/[/bold yellow]\n\n"
+            f"     优化结果保存到 [bold yellow]{container_map_path}/interactive_slam/corrected/[/bold yellow]\n\n"
             "关闭 GUI 窗口后容器将自动退出。",
             title="Interactive SLAM",
             border_style="cyan",
@@ -276,7 +397,7 @@ def start_interactive_slam(map_path):
     # 检查是否有 corrected 输出
     if not os.listdir(corrected_dir):
         console.print(
-            "[red]✗ 未在 /Map/interactive_slam/corrected/ 中检测到优化结果，"
+            f"[red]✗ 未在 {container_map_path}/interactive_slam/corrected/ 中检测到优化结果，"
             "无法继续阶段 3。[/red]"
         )
         return
@@ -367,6 +488,17 @@ def _interpolate_and_apply(map_path, frame_dir, corrected_dir, odom_files):
         except ValueError:
             continue
     raw_ids.sort()
+    frame_timestamps = _load_frame_timestamps(frame_dir)
+    use_timestamps = bool(frame_timestamps) and all(
+        frame_id in frame_timestamps for frame_id in raw_ids
+    )
+    interpolation_axis = "timestamp" if use_timestamps else "frame_id"
+    if use_timestamps:
+        console.print("[dim]将使用 frame/timestamps.txt 按真实时间插值。[/dim]")
+    else:
+        console.print(
+            "[yellow]frame/timestamps.txt 缺失或不完整，将回退为按帧编号插值。[/yellow]"
+        )
 
     if not raw_ids:
         console.print("[red]无法从 .odom 文件名中提取帧 ID。[/red]")
@@ -410,8 +542,10 @@ def _interpolate_and_apply(map_path, frame_dir, corrected_dir, odom_files):
 
     # ---- 计算关键帧上的误差漂移 Delta_T ----
     kf_ids = []
+    kf_axis = []
     delta_translations = []
     delta_quats = []
+    baseline_warnings = []
 
     console.print("计算 SE(3) 漂移修正量...")
     for data in kf_data_list:
@@ -426,31 +560,67 @@ def _interpolate_and_apply(map_path, frame_dir, corrected_dir, odom_files):
             )
             continue
 
-        T_raw = np.loadtxt(raw_odom_path)
-        if T_raw.shape != (4, 4):
+        T_current = np.loadtxt(raw_odom_path)
+        if not _is_valid_pose(T_opt) or not _is_valid_pose(T_current):
+            console.print(f"[yellow]警告: 关键帧 {stamp_id} 位姿矩阵无效，已跳过。[/yellow]")
             continue
 
+        T_saved_odom = data.get("odom")
+        if _is_valid_pose(T_saved_odom):
+            # estimate and odom were saved by the same Interactive SLAM run.
+            # Using that baseline makes replay deterministic even if frame/*.odom
+            # changed after the GUI result was written.
+            T_baseline = T_saved_odom
+            mismatch = T_current @ np.linalg.inv(T_saved_odom)
+            translation_error = float(np.linalg.norm(mismatch[:3, 3]))
+            rotation_error_deg = float(
+                np.degrees(R.from_matrix(mismatch[:3, :3]).magnitude())
+            )
+            if translation_error > 0.05 or rotation_error_deg > 0.5:
+                baseline_warnings.append(
+                    {
+                        "frame_id": stamp_id,
+                        "translation_m": translation_error,
+                        "rotation_deg": rotation_error_deg,
+                    }
+                )
+        else:
+            T_baseline = T_current
+
         # Delta_T = T_opt @ inv(T_raw)
-        T_raw_inv = np.linalg.inv(T_raw)
+        T_raw_inv = np.linalg.inv(T_baseline)
         Delta_T = T_opt @ T_raw_inv
 
         kf_ids.append(stamp_id)
+        kf_axis.append(frame_timestamps[stamp_id] if use_timestamps else float(stamp_id))
         delta_translations.append(Delta_T[:3, 3])
         r = R.from_matrix(Delta_T[:3, :3])
         delta_quats.append(r.as_quat())
 
-    if len(kf_ids) == 0:
+    if len(kf_ids) < 2:
         console.print(
-            "[red]错误: 没有关键帧能匹配到原始 .odom 文件。[/red]"
+            "[red]错误: 能匹配且有效的关键帧不足 2 个，无法进行插值。[/red]"
         )
         return
 
+    if baseline_warnings:
+        console.print(
+            f"[yellow]警告: {len(baseline_warnings)} 个关键帧的当前 .odom 与 "
+            "Interactive SLAM 保存时的 odom 不一致；将使用保存时的 odom "
+            "计算修正量，详情写入报告。[/yellow]"
+        )
+
     kf_ids = np.array(kf_ids)
+    kf_axis = np.asarray(kf_axis, dtype=np.float64)
     delta_translations = np.array(delta_translations)
+
+    if np.any(np.diff(kf_axis) <= 0):
+        console.print("[red]错误: 关键帧插值坐标不是严格递增，无法执行 Slerp。[/red]")
+        return
 
     # 构建球面线性插值器 (Slerp)
     rotations = R.from_quat(delta_quats)
-    slerp = Slerp(kf_ids, rotations)
+    slerp = Slerp(kf_axis, rotations)
 
     # ---- 备份原始 frame/ 目录 ----
     backup_dir = os.path.join(map_path, "frame_backup")
@@ -462,28 +632,36 @@ def _interpolate_and_apply(map_path, frame_dir, corrected_dir, odom_files):
             shutil.copy2(src, dst)
         console.print(f"[dim]原始 .odom 已备份到 {backup_dir}[/dim]")
 
+    run_backup_dir = _backup_odom_snapshot(
+        map_path, frame_dir, odom_files, "before_interactive_apply"
+    )
+    console.print(f"[dim]本次回填前位姿快照: {run_backup_dir}[/dim]")
+
     # ---- 对所有稠密帧插值并应用修正 ----
     console.print("插值并应用修正到所有稠密帧...")
     processed = 0
+    max_translation_correction = 0.0
+    max_rotation_correction_deg = 0.0
 
     for i in raw_ids:
         i_str = f"{i:06d}"
+        axis_value = frame_timestamps[i] if use_timestamps else float(i)
 
         # 边界处理：早于第一个 / 晚于最后一个关键帧，维持常量漂移
-        if i <= kf_ids[0]:
+        if axis_value <= kf_axis[0]:
             t = delta_translations[0]
             r = rotations[0]
-        elif i >= kf_ids[-1]:
+        elif axis_value >= kf_axis[-1]:
             t = delta_translations[-1]
             r = rotations[-1]
         else:
-            idx_right = np.searchsorted(kf_ids, i)
+            idx_right = np.searchsorted(kf_axis, axis_value)
             idx_left = idx_right - 1
 
-            id_L = kf_ids[idx_left]
-            id_R = kf_ids[idx_right]
+            value_L = kf_axis[idx_left]
+            value_R = kf_axis[idx_right]
 
-            alpha = (i - id_L) / float(id_R - id_L)
+            alpha = (axis_value - value_L) / float(value_R - value_L)
 
             # 平移：线性插值
             t_L = delta_translations[idx_left]
@@ -491,12 +669,18 @@ def _interpolate_and_apply(map_path, frame_dir, corrected_dir, odom_files):
             t = (1.0 - alpha) * t_L + alpha * t_R
 
             # 旋转：球面插值
-            r = slerp(i)
+            r = slerp(axis_value)
 
         # 重构当前帧的误差修正矩阵 Delta_T
         Delta_T = np.eye(4)
         Delta_T[:3, :3] = r.as_matrix()
         Delta_T[:3, 3] = t
+        max_translation_correction = max(
+            max_translation_correction, float(np.linalg.norm(t))
+        )
+        max_rotation_correction_deg = max(
+            max_rotation_correction_deg, float(np.degrees(r.magnitude()))
+        )
 
         # 读取原始位姿，施加修正
         raw_odom_path = os.path.join(frame_dir, f"{i_str}.odom")
@@ -507,8 +691,32 @@ def _interpolate_and_apply(map_path, frame_dir, corrected_dir, odom_files):
         np.savetxt(raw_odom_path, T_final, fmt="%.10f")
         processed += 1
 
+    report_dir = Path(map_path) / "pose_correction"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "latest_report.yaml"
+    report_path.write_text(
+        yaml.safe_dump(
+            {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "input_frames": len(raw_ids),
+                "corrected_keyframes": len(kf_ids),
+                "interpolated_frames": processed,
+                "interpolation_axis": interpolation_axis,
+                "max_translation_correction_m": max_translation_correction,
+                "max_rotation_correction_deg": max_rotation_correction_deg,
+                "saved_odom_mismatch_count": len(baseline_warnings),
+                "saved_odom_mismatches": baseline_warnings,
+                "backup": str(run_backup_dir),
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
     console.print(
         f"[green]✓ 插值回填完成！已修正 {processed}/{len(raw_ids)} 个位姿。[/green]"
     )
     console.print(f"[dim]  修正后位姿已写回: {frame_dir}[/dim]")
     console.print(f"[dim]  原始备份位于:   {backup_dir}[/dim]")
+    console.print(f"[dim]  修正报告:       {report_path}[/dim]")

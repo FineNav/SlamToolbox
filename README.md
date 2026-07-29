@@ -12,6 +12,10 @@ pip install slam_toolbox
 命令行运行：
 
 ```
+slam_toolbox
+```
+
+
+
 source /opt/ros/jazzy/setup.bash
 .venv/bin/slam_toolbox
-```

@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pose", type=Path)
     p.add_argument("--voxel-size", type=float, default=0.4)
     p.add_argument("--max-range", type=float, default=30.0)
-    p.add_argument("--local-z-min", type=float, default=-2.5)
-    p.add_argument("--local-z-max", type=float, default=3.0)
+    p.add_argument("--local-z-min", type=float, default=-2.5, help="Only points within this local z ROI can be classified as dynamic.")
+    p.add_argument("--local-z-max", type=float, default=3.0, help="Only points within this local z ROI can be classified as dynamic.")
     p.add_argument("--body-radius", type=float, default=0.0)
     p.add_argument(
         "--ground-protect-local-z-max",
@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dynamic-max-hit-time", type=float, default=2.0)
     p.add_argument("--unknown-policy", choices=("keep", "drop"), default="keep")
     p.add_argument("--progress-interval", type=int, default=25, help="Print progress every N frames; 0 disables frame progress.")
+    p.add_argument(
+        "--save-dynamic-frames",
+        action="store_true",
+        help="Also write per-frame dynamic point clouds under <out>/dynamic_frames for GIF visualization.",
+    )
     p.add_argument("--no-before", action="store_true")
     p.add_argument(
         "--deduplicate",
@@ -194,6 +199,27 @@ def write_pcd_from_payload(payload_path: Path, point_count: int, out_path: Path)
                 next_progress = copied_bytes + progress_step
     if total_bytes == 0:
         print_progress("pcd", 0, 0, progress_started, f"file={out_path.name}")
+
+
+def write_pcd_from_points(points: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    points = points.astype(np.float32, copy=False).reshape(-1, 4)
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z intensity\n"
+        "SIZE 4 4 4 4\n"
+        "TYPE F F F F\n"
+        "COUNT 1 1 1 1\n"
+        f"WIDTH {points.shape[0]}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {points.shape[0]}\n"
+        "DATA binary\n"
+    ).encode("ascii")
+    with out_path.open("wb") as f:
+        f.write(header)
+        points.tofile(f)
 
 
 def dedup_mask(points: np.ndarray, mode: str, resolution: float, seen: set) -> np.ndarray:
@@ -609,6 +635,9 @@ def main() -> int:
     dynamic_count = 0
     spatial_sort_resolution = args.spatial_sort_resolution or args.voxel_size
     interleave_resolution = args.interleave_resolution or args.voxel_size
+    dynamic_frames_dir = args.out / "dynamic_frames"
+    if args.save_dynamic_frames:
+        dynamic_frames_dir.mkdir(parents=True, exist_ok=True)
     try:
         before_file = before_payload.open("wb") if not args.no_before else None
         dedup_seen: set = set()
@@ -627,6 +656,11 @@ def main() -> int:
                             keep &= dist2 <= args.max_range * args.max_range
                     scan = scan[keep]
                     if scan.size == 0:
+                        if args.save_dynamic_frames:
+                            write_pcd_from_points(
+                                np.empty((0, 4), dtype=np.float32),
+                                dynamic_frames_dir / f"{frame_id:06d}.pcd",
+                            )
                         if args.progress_interval and (
                             done_frames == 1 or done_frames % args.progress_interval == 0 or frame_id == end
                         ):
@@ -640,10 +674,10 @@ def main() -> int:
                             )
                         continue
                     local_z = scan[:, 2]
+                    in_dynamic_roi = (local_z >= args.local_z_min) & (local_z <= args.local_z_max)
                     xyz = scan[:, :3] @ poses[frame_id][:3, :3].T + poses[frame_id][:3, 3]
                     intensity = scan[:, 3]
                     point_keys = pack_keys(np.floor(xyz / args.voxel_size).astype(np.int64))
-                    in_dynamic_roi = (local_z >= args.local_z_min) & (local_z <= args.local_z_max)
                     classified_static = np.fromiter((int(k) in kept_keys for k in point_keys), dtype=bool, count=point_keys.shape[0])
                     ground_protected = (
                         local_z <= args.ground_protect_local_z_max
@@ -663,10 +697,13 @@ def main() -> int:
                     static_points = static_points[dedup_keep]
                     if static_points.size:
                         static_points.tofile(static_file)
-                    points[~is_static].tofile(dynamic_file)
+                    dynamic_points = points[~is_static]
+                    dynamic_points.tofile(dynamic_file)
+                    if args.save_dynamic_frames:
+                        write_pcd_from_points(dynamic_points, dynamic_frames_dir / f"{frame_id:06d}.pcd")
                     static_count += int(static_points.shape[0])
                     deduplicated_after_points = static_count_before_dedup - static_count
-                    dynamic_count += int((~is_static).sum())
+                    dynamic_count += int(dynamic_points.shape[0])
 
                     if args.progress_interval and (
                         done_frames == 1 or done_frames % args.progress_interval == 0 or frame_id == end
