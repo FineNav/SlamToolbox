@@ -1,3 +1,32 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "slam_toolbox"
+version = "0.1.9"
+description = "A Python CLI tool for interactive SLAM map processing."
+authors = [{name = "FineNav"}]
+requires-python = ">=3.9"
+dependencies = [
+    "questionary>=2.0.0",
+    "imageio>=2.31.0",
+    "matplotlib>=3.5.0",
+    "numpy>=1.20.0",
+    "open3d>=0.15.0",
+    "psutil>=5.9.0",
+    "pyyaml>=6.0",
+    "rich>=12.0.0",
+    "scipy>=1.7.0",
+]
+
+[project.scripts]
+slam_toolbox = "slam_toolbox.cli:main"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["slam_toolbox"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+CMAKE_CXX_STANDARD = "17"
