@@ -169,4 +169,3 @@ Map Builder 的历史结果位于：
 
 同时会把最新结果复制到 `~/Map/<map-name>/map/map.pcd`。PGM Generator
 读取这个最新 3D 地图，并把 `map.pgm` 和 `map.yaml` 写入同一个 `map/` 目录。
-
