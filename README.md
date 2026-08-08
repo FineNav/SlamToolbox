@@ -1,54 +1,51 @@
-# SlamToolbox OctoMap
+# SlamToolbox
 
-面向 ROS2 激光点云地图的动态点清理和 OctoMap 语义层导出工具。项目包含
-Python 工作流、C++17/pybind11 native 后端，以及标准 OctoMap 文件导出。
-
-Raycast Voxel 在同一次逐帧积分中生成：
-
-- 动态清理结果：`before.pcd`、`static.pcd`、`dynamic.pcd`；
-- 标准 OctoMap：`map.bt`、`map.ot`；
-- 语义 voxel：occupied、free、unknown、traversable、risk；
-- 风险等级、机器人尺寸、阈值和统计信息。
-
-当前 native API 版本为 **5**。OctoMap 导出使用独立的完整射线 occupancy
-模型和精确 3D voxel traversal；动态清理继续使用 endpoint evidence 模型，
-因此开启 OctoMap 导出不会改变 static/dynamic PCD 分类结果。
+面向 ROS2 激光点云地图的交互式处理工具，提供 rosbag 录制、点云帧提取、
+位姿修正、动态障碍物清除、3D 地图构建和 2D 栅格地图生成。用户通过统一的
+终端菜单完成操作，不需要直接调用内部算法脚本。
 
 ## 1. 支持环境
 
-推荐环境：
+已验证和支持的环境：
 
-- Ubuntu 22.04 或 24.04；
-- Python 3.10–3.12；
+- Ubuntu 22.04 x86_64、Python 3.10、ROS2 Humble；
+- Ubuntu 24.04 x86_64、Python 3.12、ROS2 Jazzy；
 - CMake 3.18 或更高版本；
 - 支持 C++17 的编译器；
 - OctoMap development package；
-- ROS2（仅交互式完整工作流需要；直接处理已转换 KITTI 数据不需要 ROS2）。
+- ROS2 的 `rclpy` 和 rosbag2 Python 包。
 
-安装系统依赖：
+ERASOR2、Removert 和 Interactive SLAM 通过 Docker 运行；使用这些功能前还需
+按 [Docker Engine 官方文档](https://docs.docker.com/engine/install/ubuntu/)
+安装 Docker，并确保当前用户能够执行 `docker info`。其他菜单功能不要求 Docker。
+
+其他 Linux 发行版、macOS、Windows 和 ARM64 尚未验证，不能直接套用下面的
+Ubuntu 安装命令。完整安装包含 Open3D，建议至少预留 5 GiB 磁盘空间。
+
+## 2. 全新安装
+
+请先安装与 Ubuntu 版本匹配的 ROS2：
+
+- Ubuntu 22.04：[ROS2 Humble 官方安装文档](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)；
+- Ubuntu 24.04：[ROS2 Jazzy 官方安装文档](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)。
+
+ROS2 安装完成后，下面的代码块同时安装项目的系统依赖、源码和 Python 环境。
+请从上到下完整执行，不要直接跳到最后的 `pip install`：
 
 ```bash
 sudo apt update
 sudo apt install -y \
   build-essential \
   cmake \
+  git \
   liboctomap-dev \
   python3-dev \
   python3-venv
-```
 
-如果需要查看 `.bt/.ot`，可以另外安装 OctoMap Viewer：
+# 必须输出 octomap-config.cmake；没有输出时不要继续安装 Python 包。
+dpkg -L liboctomap-dev | grep -E '/octomap-(config|targets)\.cmake$'
 
-```bash
-sudo apt install -y octovis
-```
-
-## 2. 安装项目
-
-所有 Python 包和 native 扩展都建议安装在项目自己的虚拟环境中：
-
-```bash
-git clone https://github.com/FineNav/SlamToolbox
+git clone https://github.com/FineNav/SlamToolbox.git
 cd SlamToolbox
 
 python3 -m venv venv-native
@@ -56,10 +53,15 @@ venv-native/bin/python -m pip install --upgrade pip
 venv-native/bin/python -m pip install -e .
 ```
 
+`liboctomap-dev` 是 native 扩展的必需依赖，不是只在导出 OctoMap 时才需要。
+必须先安装它，再执行 `pip install -e .`；否则 CMake 会因为找不到
+`octomap-config.cmake` 而终止配置。安装 Open3D 等 Python 依赖时下载量较大，
+网速较慢并不表示 native 构建卡死。
+
 不要使用系统 Python 直接执行 `pip install`。Ubuntu 的 externally-managed
 Python 可能报 PEP 668 错误，虚拟环境可以避免这个问题。
 
-验证导入路径和 native API：
+验证当前 Python、项目路径和 native 扩展：
 
 ```bash
 venv-native/bin/python - <<'PY'
@@ -70,8 +72,6 @@ from slam_toolbox import _native
 print("python:", sys.executable)
 print("package:", slam_toolbox.__file__)
 print("native api:", _native.api_version)
-print("raycast backend:", hasattr(_native, "raycast_voxel"))
-print("octomap export:", hasattr(_native.raycast_voxel.Engine, "write_octomap"))
 PY
 ```
 
@@ -79,201 +79,89 @@ PY
 
 ```text
 native api: 5
-raycast backend: True
-octomap export: True
 ```
 
-## 3. 最简单的运行方式：直接处理 KITTI 格式数据
+## 3. 启动和使用
 
-这种方式不启动 ROS2 菜单，适合已经准备好逐帧局部点云和真实传感器位姿的用户。
+每次打开新终端后，先加载 ROS2 环境，再从项目目录启动 SlamToolbox。
 
-### 3.1 输入目录契约
-
-```text
-<kitti-root>/
-└── dataset/
-    └── sequences/
-        └── 00/
-            ├── velodyne/
-            │   ├── 000000.bin
-            │   ├── 000001.bin
-            │   └── ...
-            └── poses_odom_base.txt
-```
-
-输入要求：
-
-- 每个 `.bin` 是连续的 little-endian `float32`，每点四个值：`x y z intensity`；
-- 点必须位于对应帧的局部传感器或 `base_link` 坐标系，不能是已经注册好的全局点；
-- `poses_odom_base.txt` 每行是一帧位姿，可使用 12 个数的 3×4 矩阵，
-  或 16 个数的 4×4 矩阵；
-- 位姿必须把该帧局部点变换到全局 `odom/map` 坐标系；
-- 位姿数量必须覆盖点云帧数，不能使用全 identity 位姿。
-
-### 3.2 运行 Raycast、OctoMap 和语义层导出
+Ubuntu 22.04 / ROS2 Humble：
 
 ```bash
-venv-native/bin/python -m slam_toolbox.algorithms.raycast_voxel_cleanup \
-  --dataset /absolute/path/to/kitti-root \
-  --seq 00 \
-  --out /absolute/path/to/output-run \
-  --backend native \
-  --export-octomap \
-  --write-before \
-  --voxel-size 0.5 \
-  --ray-point-stride 1 \
-  --robot-radius 0.35 \
-  --robot-height 1.2 \
-  --robot-ground-clearance 0.05 \
-  --robot-max-step-height 0.12 \
-  --robot-safety-margin 0.20 \
-  --robot-ground-z 0.0
-```
-
-参数说明：
-
-- `--voxel-size`：OctoMap 叶节点尺寸，单位为米；
-- `--ray-point-stride 1`：每个有效点都发射 free-space 射线；增大该值可降低
-  计算量和内存，但会降低 free-space 密度；
-- `--robot-ground-z`：全局坐标系中的假设地面高度，必须按实际地图调整；
-- `--robot-radius/height`：机器人圆形 footprint 和机身高度；
-- `--robot-safety-margin`：机器人半径之外的风险膨胀距离；
-- `--risk-levels`：风险等级数量，默认 3；
-- `--compressed-octomap`：压缩 `layers.npz`，文件更小但导出更慢；
-- `--start/--end/--stride`：限制处理帧范围，便于先做小规模验证。
-
-查看全部参数：
-
-```bash
-venv-native/bin/python -m slam_toolbox.algorithms.raycast_voxel_cleanup --help
-```
-
-## 4. 输出文件
-
-指定 `--out /path/to/output-run` 后，主要输出为：
-
-```text
-output-run/
-├── raycast_before.pcd       # 使用 --write-before 时生成
-├── raycast_after.pcd        # 保留的静态点
-├── raycast_removed.pcd      # 被移除的动态点
-├── raycast_summary.txt
-└── octomap/
-    ├── map.bt               # 标准 maximum-likelihood、pruned OcTree
-    ├── map.ot               # 标准 full OcTree，保留 log-odds
-    ├── layers.npz           # 项目语义 voxel 层
-    └── meta.yaml            # 坐标系、阈值、机器人参数和数量统计
-```
-
-`layers.npz` 包含：
-
-- `occupied`：达到 occupied threshold 的 voxel；
-- `free`：达到 free threshold 的 voxel；
-- `unknown`：已观察但置信度尚未达到 occupied/free threshold 的 voxel；
-- `kept`、`removed`：动态清理 endpoint 模型的分类；
-- `traversable`：地面高度带内且通过 footprint/垂直净空检查的候选可通行 voxel；
-- `risk`、`risk_intensity`：靠近障碍物的候选风险 voxel 和风险等级；
-- `voxel_coords`、`voxel_type`：组合语义视图。
-
-`voxel_type` 编号记录在 `meta.yaml`，当前为：
-
-| ID | 类型 |
-|---:|---|
-| 0 | unknown |
-| 1 | free |
-| 2 | occupied |
-| 3 | traversable |
-| 4 | risk |
-
-读取语义层：
-
-```bash
-venv-native/bin/python - /absolute/path/to/output-run/octomap <<'PY'
-from pathlib import Path
-import sys
-import numpy as np
-import yaml
-
-root = Path(sys.argv[1])
-layers = np.load(root / "layers.npz")
-meta = yaml.safe_load((root / "meta.yaml").read_text(encoding="utf-8"))
-
-print(meta["counts"])
-print("free:", layers["free"].shape)
-print("traversable:", layers["traversable"].shape)
-print("risk:", layers["risk"].shape)
-PY
-```
-
-使用 OctoVis 查看标准 OctoMap：
-
-```bash
-octovis /absolute/path/to/output-run/octomap/map.bt
-```
-
-## 5. ROS2 交互式完整工作流
-
-交互式入口支持 rosbag、帧提取、位姿修正、ERASOR2、Removert、Local Hash
-Voxel、Raycast Voxel 和地图构建。该入口会扫描 `~/Map` 下的地图目录。
-
-先加载 ROS2 环境，再启动：
-
-```bash
-source /opt/ros/$ROS_DISTRO/setup.bash
-cd /absolute/path/to/SlamToolbox
+source /opt/ros/humble/setup.bash
+cd ~/SlamToolbox
+venv-native/bin/python -c "import rclpy, rosbag2_py"
 venv-native/bin/slam_toolbox
 ```
 
-典型地图目录：
+Ubuntu 24.04 / ROS2 Jazzy：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd ~/SlamToolbox
+venv-native/bin/python -c "import rclpy, rosbag2_py"
+venv-native/bin/slam_toolbox
+```
+
+如果项目没有克隆在 `~/SlamToolbox`，把 `cd` 后面的路径换成实际项目路径。
+如果还使用自己的 ROS2 工作空间，应在加载系统 ROS2 后继续 source 该工作空间的
+`install/setup.bash`。
+
+启动后按终端菜单操作：
+
+1. 选择已有地图，或者选择“新建地图”并输入名称；
+2. 第一次进入地图时确认 `fixed_frame`、`base_link_frame` 和点云话题；
+3. 进入 `3D Map`，根据数据状态依次完成 rosbag 录制、Frame Extractor、
+   位姿修正、动态障碍物清除和 Map Builder；不需要的步骤可以跳过；
+4. 需要 2D 导航地图时，进入 `2D Map` 并选择 PGM Generator；
+5. 每个功能完成后，终端都会打印本次输出的绝对路径。
+
+SlamToolbox 只扫描 `~/Map` 下的地图目录。选择“新建地图”时会自动创建基本目录；
+已有 rosbag 也可以放到 `~/Map/<地图名称>/bag/` 后再启动工具。
+
+## 4. 输入和输出位置
+
+一个地图的主要目录如下：
 
 ```text
 ~/Map/<map-name>/
-├── bag/
-├── map/
-└── config.yaml
+├── config.yaml                         # 地图坐标系和点云话题
+├── bag/                                # 录制或导入的 rosbag
+├── frame/                              # 提取的 PCD 帧和对应 .odom 位姿
+├── interactive_slam/
+│   ├── original/                       # 位姿图原始数据
+│   └── corrected/                      # 交互优化结果
+├── pose_correction/                    # 位姿修正报告和备份
+├── runs/
+│   ├── <dynamic-method>/<timestamp>/   # 每次动态清除的独立结果
+│   └── map_builder/<timestamp>/        # 每次 3D 建图结果
+└── map/
+    ├── map.pcd                         # 最新 3D 地图
+    ├── map.pgm                         # 最新 2D 栅格图
+    └── map.yaml                        # ROS2 2D 地图配置
 ```
 
-`config.yaml` 的最小内容：
-
-```yaml
-config:
-  fixed_frame: odom
-  base_link_frame: base_link
-  pointcloud_topic: /cloud_registered
-```
-
-在菜单中选择：
+动态障碍物清除的每次运行都写入新的时间戳目录，不会覆盖以前的结果：
 
 ```text
-3D Map -> Raycast Voxel
+~/Map/<map-name>/runs/<dynamic-method>/<timestamp>/
+├── before.pcd            # 动态清除前的完整点云
+├── static.pcd            # 动态清除后的静态点云
+├── dynamic.pcd           # 被移除的动态点
+├── resource_usage.yaml   # 运行时间和资源统计
+└── ...                   # 参数、日志和可视化文件
 ```
 
-交互式 Raycast 默认开启 OctoMap 导出，并将结果写入：
+Map Builder 的历史结果位于：
 
 ```text
-~/Map/<map-name>/runs/raycast_voxel/<timestamp>/
+~/Map/<map-name>/runs/map_builder/<timestamp>/map.pcd
 ```
 
-第一次运行会显示参数，确认后把参数保存在地图目录中；后续运行会复用并允许修改。
-bag 转 KITTI 和轨迹插值依赖 ROS2 Python 包以及有效的 corrected trajectory。
+同时会把最新结果复制到 `~/Map/<map-name>/map/map.pcd`。PGM Generator
+读取这个最新 3D 地图，并把 `map.pgm` 和 `map.yaml` 写入同一个 `map/` 目录。
 
-## 6. 安装验证
-
-本发布目录不包含开发测试集。安装完成后，可以用下面的命令检查 native API
-和 Raycast 命令行入口：
-
-```bash
-venv-native/bin/python -c \
-  "from slam_toolbox import _native; print(_native.api_version)"
-
-venv-native/bin/python -m \
-  slam_toolbox.algorithms.raycast_voxel_cleanup --help
-```
-
-第一条命令应输出 `5`，第二条命令应正常显示 Raycast 和 OctoMap 参数。
-发布前的开发工作树已通过 native、完整 free-space、动态分类不变性和资源报告测试。
-
-## 7. 常见问题
+## 5. 常见问题
 
 ### CMake 找不到 OctoMap
 
@@ -283,17 +171,35 @@ venv-native/bin/python -m \
 Could not find a package configuration file provided by "octomap"
 ```
 
-确认安装 development package：
+这表示 native 扩展在 CMake 配置阶段没有找到 OctoMap，并非 pip wheel
+本身出错。先安装 development package，并确认 CMake 配置文件存在：
 
 ```bash
+sudo apt update
 sudo apt install -y liboctomap-dev
-dpkg -L liboctomap-dev | grep octomap-config.cmake
+dpkg -L liboctomap-dev | grep -E '/octomap-(config|targets)\.cmake$'
 ```
 
-然后重新执行：
+Ubuntu 的常见输出路径是：
+
+```text
+/usr/lib/x86_64-linux-gnu/cmake/octomap/octomap-config.cmake
+```
+
+然后在项目根目录重新执行：
 
 ```bash
-venv-native/bin/python -m pip install -e . --no-deps
+venv-native/bin/python -m pip install -e .
+```
+
+如果上面的 `dpkg -L` 能找到配置文件，但 CMake 仍然报告同一个错误，可以
+显式传入当前系统的 multiarch 路径：
+
+```bash
+octomap_cmake_dir="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/cmake/octomap"
+
+CMAKE_ARGS="-Doctomap_DIR=${octomap_cmake_dir}" \
+  venv-native/bin/python -m pip install -e .
 ```
 
 ### API 版本不是 5
@@ -314,21 +220,29 @@ PY
 
 确保所有路径都指向当前项目目录，然后重新执行 editable install。
 
-### `traversable` 为空或范围不正确
+### 启动时提示未检测到 ROS2 环境
 
-优先检查 `robot_ground_z`、`voxel_size`、局部 Z ROI 和 free voxel 数量。
-`robot_ground_z` 是全局地图坐标，不一定等于传感器局部坐标中的地面高度。
+说明当前终端没有加载 ROS2。Ubuntu 22.04 执行：
 
-## 8. 当前导航语义边界
+```bash
+source /opt/ros/humble/setup.bash
+```
 
-完整射线 free-space 已实现，但 `traversable` 仍是候选导航层。目前检查的是：
+Ubuntu 24.04 执行：
 
-- 固定地面高度带；
-- 圆形机器人 footprint；
-- 机器人高度范围内的障碍物净空；
-- 障碍物附近的风险距离。
+```bash
+source /opt/ros/jazzy/setup.bash
+```
 
-目前尚未验证地面支撑、坡度、悬崖/落差、图连通性或车辆运动学约束。
-在用于真实机器人自主导航前，应结合地形分析、路径连通性和现场安全策略继续验证。
+然后回到项目目录重新执行 `venv-native/bin/slam_toolbox`。
+
+### `pip install` 下载很慢
+
+Open3D 及其依赖体积较大。网络中断后可以直接重新执行同一条命令，pip 会复用
+已经下载的缓存：
+
+```bash
+venv-native/bin/python -m pip install -e . --retries 10 --timeout 120
+```
 
 选择并添加合适的开源许可证；在此之前，源码不应被默认视为获得开源授权。
