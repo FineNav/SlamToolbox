@@ -52,6 +52,21 @@ venv-native/bin/python -m pip install --upgrade pip
 venv-native/bin/python -m pip install -e .
 ```
 
+安装 PyPI 发布版时，在完成上述系统依赖安装后，可以用下面的命令替代
+`git clone` 和 editable install：
+
+```bash
+python3 -m venv venv-native
+venv-native/bin/python -m pip install --upgrade pip
+venv-native/bin/python -m pip install slam_toolbox==0.2.0
+```
+
+需要升级到 PyPI 上的最新发布版时执行：
+
+```bash
+venv-native/bin/python -m pip install --upgrade slam_toolbox
+```
+
 `liboctomap-dev` 是 native 扩展的必需依赖，不是只在导出 OctoMap 时才需要。
 必须先安装它，再执行 `pip install -e .`；否则 CMake 会因为找不到
 `octomap-config.cmake` 而终止配置。安装 Open3D 等 Python 依赖时下载量较大，
