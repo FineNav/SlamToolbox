@@ -48,7 +48,7 @@ sudo apt install -y octovis
 所有 Python 包和 native 扩展都建议安装在项目自己的虚拟环境中：
 
 ```bash
-git clone <你的仓库地址>
+git clone https://github.com/FineNav/SlamToolbox
 cd SlamToolbox
 
 python3 -m venv venv-native
