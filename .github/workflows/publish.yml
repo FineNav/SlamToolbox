@@ -1,53 +1,93 @@
-name: Auto Tag and Publish
+name: Build and Publish
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'setup.py'
+    tags:
+      - "v*"
+permissions:
+  contents: read
 
 jobs:
-  auto-tag:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      tag_created: ${{ steps.create_tag.outputs.created }}
+  build-wheels:
+    name: Build Python ${{ matrix.python-version }} wheel
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract version from setup.py
-        id: version
-        run: |
-          VERSION=$(grep -Po 'version\s*=\s*"\K[^"]*' setup.py)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Extracted version: $VERSION"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-      - name: Check and create tag
-        id: create_tag
+      - name: Install native build dependencies
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists, skipping."
-            echo "created=false" >> $GITHUB_OUTPUT
-          else
-            git tag "$TAG"
-            git push origin "$TAG"
-            echo "Tag $TAG created and pushed."
-            echo "created=true" >> $GITHUB_OUTPUT
-          fi
+          sudo apt-get update
+          sudo apt-get install -y liboctomap-dev
 
-  publish:
-    needs: auto-tag
-    if: needs.auto-tag.outputs.tag_created == 'true'
-    name: Build and publish to PyPI
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
+      - name: Install Python build tools
+        run: python -m pip install --upgrade pip build tomli
+
+      - name: Verify tag and package versions
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+
+          tag_version = "${{ github.ref_name }}".removeprefix("v")
+          project_version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          setup_text = pathlib.Path("setup.py").read_text()
+          setup_version = re.search(r'version\s*=\s*["\x27]([^"\x27]+)', setup_text).group(1)
+          assert tag_version == project_version == setup_version, (
+              f"version mismatch: tag={tag_version}, pyproject={project_version}, setup={setup_version}"
+          )
+          PY
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Smoke-test wheel
+        env:
+          EXPECTED_VERSION: ${{ github.ref_name }}
+        run: |
+          python -m venv /tmp/slam-toolbox-wheel-test
+          /tmp/slam-toolbox-wheel-test/bin/python -m pip install --no-deps dist/*.whl
+          cd /tmp
+          /tmp/slam-toolbox-wheel-test/bin/python - <<'PY'
+          import os
+          from importlib.metadata import version
+          from slam_toolbox import _native
+
+          expected_version = os.environ["EXPECTED_VERSION"].removeprefix("v")
+          assert version("slam_toolbox") == expected_version
+          assert _native.api_version == 5
+          print("package version:", version("slam_toolbox"))
+          print("native api:", _native.api_version)
+          PY
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
@@ -58,13 +98,40 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build
+      - name: Install Python build tools
+        run: python -m pip install --upgrade pip build twine
 
-      - name: Build binary wheel and source tarball
-        run: python -m build
+      - name: Build and validate source distribution
+        run: |
+          python -m build --sdist
+          python -m twine check dist/*
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-distribution
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs:
+      - build-wheels
+      - build-sdist
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: dist
+          merge-multiple: true
+
+      - name: Show distributions
+        run: ls -lh dist
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
