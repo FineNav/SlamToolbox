@@ -30,7 +30,6 @@ Ubuntu 安装命令。完整安装包含 Open3D，建议至少预留 5 GiB 磁�
 - Ubuntu 24.04：[ROS2 Jazzy 官方安装文档](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)。
 
 ROS2 安装完成后，下面的代码块同时安装项目的系统依赖、源码和 Python 环境。
-请从上到下完整执行，不要直接跳到最后的 `pip install`：
 
 ```bash
 sudo apt update
@@ -90,7 +89,10 @@ Ubuntu 22.04 / ROS2 Humble：
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/SlamToolbox
-venv-native/bin/python -c "import rclpy, rosbag2_py"
+venv-native/bin/python -c "import rclpy, rosbag2_py" 
+venv-native/bin/slam_toolbox
+或
+source /opt/ros/humble/setup.bash
 venv-native/bin/slam_toolbox
 ```
 
@@ -100,6 +102,9 @@ Ubuntu 24.04 / ROS2 Jazzy：
 source /opt/ros/jazzy/setup.bash
 cd ~/SlamToolbox
 venv-native/bin/python -c "import rclpy, rosbag2_py"
+venv-native/bin/slam_toolbox
+或
+source /opt/ros/jazzy/setup.bash
 venv-native/bin/slam_toolbox
 ```
 
