@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish, for example 0.2.0"
+        required: true
+        type: string
+
 permissions:
   contents: read
 
@@ -37,7 +44,6 @@ jobs:
         run: python -m pip install --upgrade pip build tomli
 
       - name: Verify tag and package versions
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           python - <<'PY'
           import pathlib
@@ -47,12 +53,12 @@ jobs:
           except ModuleNotFoundError:
               import tomli as tomllib
 
-          tag_version = "${{ github.ref_name }}".removeprefix("v")
+          requested_version = "${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}".removeprefix("v")
           project_version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
           setup_text = pathlib.Path("setup.py").read_text()
           setup_version = re.search(r'version\s*=\s*["\x27]([^"\x27]+)', setup_text).group(1)
-          assert tag_version == project_version == setup_version, (
-              f"version mismatch: tag={tag_version}, pyproject={project_version}, setup={setup_version}"
+          assert requested_version == project_version == setup_version, (
+              f"version mismatch: requested={requested_version}, pyproject={project_version}, setup={setup_version}"
           )
           PY
 
@@ -61,7 +67,7 @@ jobs:
 
       - name: Smoke-test wheel
         env:
-          EXPECTED_VERSION: ${{ github.ref_name }}
+          EXPECTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           python -m venv /tmp/slam-toolbox-wheel-test
           /tmp/slam-toolbox-wheel-test/bin/python -m pip install --no-deps dist/*.whl
