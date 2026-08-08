@@ -89,9 +89,11 @@ Ubuntu 22.04 / ROS2 Humble：
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/SlamToolbox
-venv-native/bin/python -c "import rclpy, rosbag2_py" 
+venv-native/bin/python -c "import rclpy, rosbag2_py" （自检，不是每次必须）
 venv-native/bin/slam_toolbox
+```
 或
+```
 source /opt/ros/humble/setup.bash
 venv-native/bin/slam_toolbox
 ```
@@ -101,9 +103,11 @@ Ubuntu 24.04 / ROS2 Jazzy：
 ```bash
 source /opt/ros/jazzy/setup.bash
 cd ~/SlamToolbox
-venv-native/bin/python -c "import rclpy, rosbag2_py"
+venv-native/bin/python -c "import rclpy, rosbag2_py"（自检，不是每次必须）
 venv-native/bin/slam_toolbox
+```
 或
+```
 source /opt/ros/jazzy/setup.bash
 venv-native/bin/slam_toolbox
 ```
