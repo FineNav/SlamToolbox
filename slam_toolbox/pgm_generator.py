@@ -20,7 +20,7 @@ def start_generation(map_path):
     occupied_thresh = int(questionary.text("OCCUPIED_THRESH (占有栅格的点数阈值):", default="2").ask())
 
     print("开始生成 2D 栅格地图...")
-    
+
     # 1. 加载点云
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
@@ -63,7 +63,7 @@ def start_generation(map_path):
 
     # 7. 根据阈值生成 PGM 图像数组
     pgm_img = np.ones((height, width), dtype=np.uint8) * 205  # 默认 Unknown 205
-    
+
     # 填充 Free 与 Occupied 区域 (简单逻辑：投影有数据点记为 Occupied，无数据记为 Free 254)
     # 本算法使用基础投影：若格子内点数超过阈值则判定为障碍，其余物理范围内区域置为白色
     pgm_img[:, :] = 254  # 基础设为白色

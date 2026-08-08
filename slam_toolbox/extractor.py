@@ -5,6 +5,7 @@ import warnings
 import questionary
 import numpy as np
 import open3d as o3d
+from datetime import datetime
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 
@@ -16,6 +17,8 @@ try:
     from rosidl_runtime_py.utilities import get_message
 except ImportError:
     rosbag2_py = None
+    deserialize_message = None
+    get_message = None
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +58,12 @@ def _invert_transform(T):
     return Tinv
 
 
-def _find_transform_at(entries, timestamp):
+def _find_transform_at(entries, timestamp, max_start_extrapolation=0.25):
     if not entries:
+        return None
+    if timestamp < entries[0][0]:
+        if entries[0][0] - timestamp <= max_start_extrapolation:
+            return entries[0][1]
         return None
     lo, hi = 0, len(entries) - 1
     best = None
@@ -87,6 +94,15 @@ def lookup_transform(tf_buffer, parent, child, timestamp):
     if rev_key in tf_buffer['static']:
         return _invert_transform(tf_buffer['static'][rev_key][1])
     return None
+
+
+def _message_time_sec(msg, bag_timestamp_ns=None):
+    sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+    if sec > 0.0:
+        return sec, "header"
+    if bag_timestamp_ns is not None:
+        return bag_timestamp_ns * 1e-9, "bag"
+    return sec, "header_zero"
 
 
 def _lookup_or_eye(tf_buffer, parent, child, timestamp, warn_set, warn_tag):
@@ -195,18 +211,29 @@ def _read_pcd(path):
     """读取 PCD 文件 → (xyz_float32, intensity_float32 或 None)"""
     with open(path, 'rb') as f:
         header = b''
+        data_mode = None
         while True:
             line = f.readline()
+            if not line:
+                raise ValueError(f"PCD 文件缺少 DATA 行: {path}")
             header += line
-            if line.strip() == b'DATA binary':
+            stripped = line.strip()
+            if stripped.startswith(b'DATA '):
+                data_mode = stripped.split(None, 1)[1].decode('ascii', errors='replace').lower()
                 break
-        raw = f.read()
 
-    header_str = header.decode('ascii', errors='replace')
-    fields = re.search(r'FIELDS\s+(.+)', header_str).group(1).split()
-    points  = int(re.search(r'POINTS\s+(\d+)', header_str).group(1))
+        header_str = header.decode('ascii', errors='replace')
+        fields = re.search(r'FIELDS\s+(.+)', header_str).group(1).split()
+        points = int(re.search(r'POINTS\s+(\d+)', header_str).group(1))
 
-    data = np.frombuffer(raw, dtype=np.float32).reshape(points, len(fields))
+        if data_mode == 'binary':
+            raw = f.read()
+            data = np.frombuffer(raw, dtype=np.float32).reshape(points, len(fields))
+        elif data_mode == 'ascii':
+            data = np.loadtxt(f, dtype=np.float32, max_rows=points)
+            data = np.asarray(data, dtype=np.float32).reshape(points, len(fields))
+        else:
+            raise ValueError(f"不支持的 PCD DATA 格式: {data_mode} ({path})")
 
     xi, yi, zi = fields.index('x'), fields.index('y'), fields.index('z')
     xyz = np.ascontiguousarray(data[:, [xi, yi, zi]])
@@ -241,6 +268,89 @@ DATA binary
     with open(path, 'wb') as f:
         f.write(header.encode('ascii'))
         f.write(data.tobytes())
+
+
+def _prompt_frame_sampling_mode(total_cloud_msgs):
+    """Ask how to sample accumulated frames from raw bag scans."""
+    mode = questionary.select(
+        f"选择 Frame Extractor 的采样方式（原始点云 {total_cloud_msgs} 帧）:",
+        choices=[
+            "按原始点云帧比例（推荐，默认 1/4）",
+            "按累计时长（兼容旧流程）",
+        ],
+        default="按原始点云帧比例（推荐，默认 1/4）",
+    ).ask()
+    if mode is None:
+        return None, None
+
+    if "比例" in mode:
+        ratio = questionary.select(
+            "选择保留比例:",
+            choices=[
+                "1/4（推荐）",
+                "1/5",
+                "1/6",
+                "自定义",
+            ],
+            default="1/4（推荐）",
+        ).ask()
+        if ratio is None:
+            return None, None
+        if ratio == "1/4（推荐）":
+            return "ratio", 0.25
+        if ratio == "1/5":
+            return "ratio", 0.2
+        if ratio == "1/6":
+            return "ratio", 1.0 / 6.0
+        ratio_text = questionary.text(
+            "输入保留比例（0~1，例如 0.25）:",
+            default="0.25",
+        ).ask()
+        try:
+            ratio_value = float(ratio_text)
+            if not (0.0 < ratio_value <= 1.0):
+                raise ValueError
+        except (TypeError, ValueError):
+            console.print("[yellow]比例输入无效，使用默认值 1/4。[/yellow]")
+            ratio_value = 0.25
+        return "ratio", ratio_value
+
+    interval_str = questionary.text(
+        "请输入点云累计保存时长间隔 (秒):", default="1.0"
+    ).ask()
+    try:
+        interval = float(interval_str)
+        if interval <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        console.print("[yellow]累计间隔无效，使用默认值 1.0 秒。[/yellow]")
+        interval = 1.0
+    return "time", interval
+
+
+def _backup_existing_frame_outputs(frame_dir):
+    """Move existing extractor outputs away before writing a new frame set."""
+    if not os.path.isdir(frame_dir):
+        return None
+    names = [
+        name for name in os.listdir(frame_dir)
+        if name.endswith((".pcd", ".odom"))
+        or name in ("timestamps.txt", "extraction_metadata.txt")
+    ]
+    if not names:
+        return None
+
+    backup_root = os.path.join(frame_dir, "extractor_backups")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = os.path.join(backup_root, stamp)
+    suffix = 1
+    while os.path.exists(backup_dir):
+        backup_dir = os.path.join(backup_root, f"{stamp}_{suffix:02d}")
+        suffix += 1
+    os.makedirs(backup_dir, exist_ok=True)
+    for name in names:
+        os.replace(os.path.join(frame_dir, name), os.path.join(backup_dir, name))
+    return backup_dir
 
 
 # ---------------------------------------------------------------------------
@@ -292,14 +402,6 @@ def start_extraction(map_path, config=None):
     if not db_file:
         console.print(f"[red]未在 {bag_dir} 下找到 .db3 或 .mcap。[/red]")
         return
-
-    interval_str = questionary.text(
-        "请输入点云累计保存时长间隔 (秒):", default="1.0"
-    ).ask()
-    try:
-        interval = float(interval_str)
-    except ValueError:
-        interval = 1.0
 
     storage_options = rosbag2_py.StorageOptions(uri=bag_dir, storage_id="sqlite3")
     converter_options = rosbag2_py.ConverterOptions(
@@ -368,6 +470,23 @@ def start_extraction(map_path, config=None):
         )
         return
 
+    sampling_mode, sampling_value = _prompt_frame_sampling_mode(total_cloud_msgs)
+    if sampling_mode is None:
+        console.print("[yellow]已取消 Frame Extractor。[/yellow]")
+        return
+
+    if sampling_mode == "ratio":
+        target_ratio = float(sampling_value)
+        cloud_stride = max(1, int(round(1.0 / target_ratio)))
+        console.print(
+            f"[dim]采样模式: 按原始点云帧比例，保留约 1/{cloud_stride} "
+            f"(目标比例 {target_ratio:.6f})[/dim]"
+        )
+    else:
+        interval = float(sampling_value)
+        cloud_stride = None
+        console.print(f"[dim]采样模式: 按累计时长 {interval:.3f} 秒[/dim]")
+
     tf_frames = set()
     for (p, c) in list(dynamic_tf.keys()) + list(static_tf.keys()):
         tf_frames.add(p)
@@ -378,14 +497,20 @@ def start_extraction(map_path, config=None):
     # 预先检查 TF 链完整性
     _check_tf_chain(tf_buffer, fixed_frame, base_link_frame, pointcloud_topic)
 
+    backup_dir = _backup_existing_frame_outputs(frame_dir)
+    if backup_dir:
+        console.print(f"[dim]已有 frame 输出已备份到: {backup_dir}[/dim]")
+
     # ====== 第二遍：按时间窗口累积 ======
     reader.open(storage_options, converter_options)
 
     frame_idx = 0
     window_start = -1.0
+    cloud_count_in_frame = 0
     accumulated_points = []
     accumulated_intensities = []
     reference_pose = None
+    frame_reference_times = []
     cloud_msg_type = None
     first_cloud_frame = None
     has_intensity = False
@@ -412,7 +537,7 @@ def start_extraction(map_path, config=None):
                 if cloud_msg_type is None:
                     cloud_msg_type = get_message(type_map[topic])
                 msg = deserialize_message(data, cloud_msg_type)
-                sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                sec, _ = _message_time_sec(msg, t)
                 cloud_frame = msg.header.frame_id if msg.header.frame_id else base_link_frame
 
                 if first_cloud_frame is None:
@@ -420,6 +545,7 @@ def start_extraction(map_path, config=None):
 
                 if window_start < 0:
                     window_start = sec
+                    cloud_count_in_frame = 0
 
                 # 核心变换: cloud_frame(t) → base_link_frame(t0)
                 T_rel, T_fixed_to_base_ref = _compute_cloud_to_baselink_ref(
@@ -430,6 +556,7 @@ def start_extraction(map_path, config=None):
                 if reference_pose is None:
                     reference_pose = T_fixed_to_base_ref.copy()
 
+                cloud_count_in_frame += 1
                 xyz, intensity = parse_pc2_msg(msg)
                 if len(xyz) > 0:
                     if intensity is not None:
@@ -444,13 +571,24 @@ def start_extraction(map_path, config=None):
                     accumulated_points.append(transformed)
                     accumulated_intensities.append(intensity)
 
-                if sec - window_start >= interval:
-                    _save_accumulated_frame(frame_dir, frame_idx,
-                                            accumulated_points,
-                                            accumulated_intensities,
-                                            reference_pose,
-                                            has_intensity)
-                    frame_idx += 1
+                should_save = False
+                if sampling_mode == "ratio":
+                    should_save = cloud_count_in_frame >= cloud_stride
+                else:
+                    should_save = sec - window_start >= interval
+
+                if should_save:
+                    saved = _save_accumulated_frame(
+                        frame_dir,
+                        frame_idx,
+                        accumulated_points,
+                        accumulated_intensities,
+                        reference_pose,
+                        has_intensity,
+                    )
+                    if saved:
+                        frame_reference_times.append((frame_idx, window_start))
+                        frame_idx += 1
                     accumulated_points = []
                     accumulated_intensities = []
                     reference_pose = None
@@ -460,12 +598,37 @@ def start_extraction(map_path, config=None):
                 progress.update(task, completed=msg_idx)
 
     if accumulated_points:
-        _save_accumulated_frame(frame_dir, frame_idx,
-                                accumulated_points,
-                                accumulated_intensities,
-                                reference_pose,
-                                has_intensity)
-        frame_idx += 1
+        saved = _save_accumulated_frame(frame_dir, frame_idx,
+                                        accumulated_points,
+                                        accumulated_intensities,
+                                        reference_pose,
+                                        has_intensity)
+        if saved:
+            frame_reference_times.append((frame_idx, window_start))
+            frame_idx += 1
+
+    # Keep the exact bag time represented by every accumulated frame.  The
+    # pose-correction pipeline uses these control times to interpolate the
+    # Interactive SLAM correction back onto individual bag scans.
+    timestamps_path = os.path.join(frame_dir, "timestamps.txt")
+    with open(timestamps_path, "w", encoding="utf-8") as f:
+        f.write("# frame_id reference_time_sec\n")
+        for saved_frame_idx, reference_time in frame_reference_times:
+            f.write(f"{saved_frame_idx:06d} {reference_time:.9f}\n")
+
+    metadata_path = os.path.join(frame_dir, "extraction_metadata.txt")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        f.write(f"source_bag: {bag_dir}\n")
+        f.write(f"pointcloud_topic: {pointcloud_topic}\n")
+        f.write(f"original_cloud_messages: {total_cloud_msgs}\n")
+        f.write(f"sample_mode: {sampling_mode}\n")
+        if sampling_mode == "ratio":
+            f.write(f"sample_ratio: {target_ratio:.9f}\n")
+            f.write(f"sample_cloud_stride: {cloud_stride}\n")
+            f.write(f"effective_sample_ratio: {1.0 / cloud_stride:.9f}\n")
+        else:
+            f.write(f"accumulation_interval_sec: {interval:.9f}\n")
+        f.write(f"frames_written: {frame_idx}\n")
 
     # 汇总 TF 断链警告
     if warn_set:
@@ -511,7 +674,7 @@ def _save_accumulated_frame(frame_dir, frame_idx,
                             point_arrays, intensity_arrays,
                             reference_pose, has_intensity):
     if not point_arrays:
-        return
+        return False
     xyz = np.vstack(point_arrays)
 
     pcd_path = os.path.join(frame_dir, f"{frame_idx:06d}.pcd")
@@ -525,6 +688,7 @@ def _save_accumulated_frame(frame_dir, frame_idx,
     if reference_pose is None:
         reference_pose = np.eye(4)
     np.savetxt(odom_path, reference_pose, fmt="%.6f")
+    return True
 
 
 # ---------------------------------------------------------------------------
