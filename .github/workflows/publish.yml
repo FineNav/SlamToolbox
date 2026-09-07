@@ -38,10 +38,10 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y liboctomap-dev patchelf
+          sudo apt-get install -y liboctomap-dev
 
       - name: Install Python build tools
-        run: python -m pip install --upgrade pip auditwheel build tomli
+        run: python -m pip install --upgrade pip auditwheel patchelf build tomli
 
       - name: Verify tag and package versions
         run: |
