@@ -57,7 +57,14 @@ class RecorderMonitor(Node):
 
 
 def ros_spin_thread(node):
-    rclpy.spin(node)
+    from rclpy.executors import ExternalShutdownException
+
+    try:
+        rclpy.spin(node)
+    except ExternalShutdownException:
+        # 正常关闭路径：Ctrl+C 触发 rclpy 信号处理器调用 rclpy.shutdown()，
+        # spin 会抛出 ExternalShutdownException。这不是错误，直接吞掉即可。
+        pass
 
 
 def generate_status_table(count, x, y, elapsed, fixed_frame, base_link_frame, pointcloud_topic):
@@ -150,5 +157,6 @@ def start_recording(map_path, config=None):
 
         # 清理节点
         monitor_node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
         console.print("\n录制已结束，数据已保存。")
