@@ -332,8 +332,8 @@ def start_erasor2(map_path):
         return
 
     print(
-        "ERASOR2 将使用 bag 的逐扫描点云，并使用 Interactive SLAM 的 corrected "
-        "轨迹生成 KITTI 数据集（不直接使用 frame/ 聚合 PCD）。\n"
+        "ERASOR2 将使用 bag 的逐扫描点云，并使用 frame/ 中的位姿轨迹"
+        "（未做 Interactive SLAM 时为原始 odom）生成 KITTI 数据集。\n"
     )
 
     # 用户配置 Z 范围

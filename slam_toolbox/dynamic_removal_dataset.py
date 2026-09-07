@@ -29,7 +29,10 @@ def _has_current_bag_local_transform(seq_dir):
         and "point_transform:" in notes
         and "cloud_frame_written: base_link" in notes
         and "time_source:" in notes
-        and "pose_source: interactive_slam_corrected" in notes
+        and (
+            "pose_source: interactive_slam_corrected" in notes
+            or "pose_source: raw_odom" in notes
+        )
     )
 
 

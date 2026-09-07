@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         help="Also write per-frame dynamic point clouds under <out>/dynamic_frames for GIF visualization.",
     )
     p.add_argument("--write-before", action="store_true", help="Also write local_hash_voxel_before.pcd.")
+    p.add_argument(
+        "--export-voxel-size",
+        type=float,
+        default=0.0,
+        help="Voxel-downsample the exported static PCD to this voxel size (meters); 0 keeps original points.",
+    )
     return p.parse_args()
 
 
@@ -154,6 +160,28 @@ def write_pcd_from_payload(payload_path: Path, point_count: int, out_path: Path)
                 next_progress = copied_bytes + progress_step
     if total_bytes == 0:
         print_progress("pcd", 0, 0, progress_started, f"file={out_path.name}")
+
+
+def write_pcd_from_payload_downsampled(
+    payload_path: Path, point_count: int, out_path: Path, voxel_size: float
+) -> None:
+    """Write a payload to PCD, optionally voxel-downsampling it (one point per voxel)."""
+    if voxel_size <= 0 or point_count == 0:
+        write_pcd_from_payload(payload_path, point_count, out_path)
+        return
+    data = np.fromfile(payload_path, dtype=np.float32).reshape(-1, 4)
+    coords = np.floor(data[:, :3].astype(np.float64) / voxel_size).astype(np.int64)
+    coords = np.ascontiguousarray(coords)
+    key_dtype = np.dtype((np.void, coords.dtype.itemsize * coords.shape[1]))
+    keys = coords.view(key_dtype).reshape(-1)
+    _, indices = np.unique(keys, return_index=True)
+    indices.sort()
+    write_pcd_from_points(data[indices].astype(np.float32, copy=False), out_path)
+    print(
+        f"[pcd] {out_path.name}: voxel-downsampled {point_count:,} -> {indices.shape[0]:,} points "
+        f"(voxel={voxel_size:g} m)",
+        flush=True,
+    )
 
 
 def write_pcd_from_points(points: np.ndarray, out_path: Path) -> None:
@@ -597,7 +625,9 @@ def main() -> int:
         print("[pcd] writing output PCD files", flush=True)
         if args.write_before:
             write_pcd_from_payload(before_payload, before_count, args.out / "local_hash_voxel_before.pcd")
-        write_pcd_from_payload(static_payload, static_count, args.out / "local_hash_voxel_after.pcd")
+        write_pcd_from_payload_downsampled(
+            static_payload, static_count, args.out / "local_hash_voxel_after.pcd", args.export_voxel_size
+        )
         write_pcd_from_payload(dynamic_payload, dynamic_count, args.out / "local_hash_voxel_dynamic.pcd")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -615,6 +645,7 @@ def main() -> int:
                 f"pose: {pose_path}",
                 f"frames: {args.start}..{end}",
                 f"voxel_size: {args.voxel_size}",
+                f"export_voxel_size: {args.export_voxel_size}",
                 f"max_range: {args.max_range}",
                 f"local_z_min: {args.local_z_min}",
                 f"local_z_max: {args.local_z_max}",

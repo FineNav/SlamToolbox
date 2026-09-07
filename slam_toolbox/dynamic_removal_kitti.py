@@ -269,6 +269,19 @@ def _reconstruct_legacy_frame_timestamps(map_path, config):
         return
 
 
+def _identity_correction():
+    """未做 Interactive SLAM 时的占位修正：保持原始 odom 位姿不变。"""
+    return {
+        "identity": True,
+        "pose_source": "raw_odom",
+        "count": 0,
+        "times": np.asarray([], dtype=np.float64),
+        "translations": np.empty((0, 3), dtype=np.float64),
+        "rotations": None,
+        "slerp": None,
+    }
+
+
 def _load_interactive_slam_correction(map_path, config=None, tf_buffer=None):
     """Load dense frame corrections as time-indexed SE(3) control points.
 
@@ -276,15 +289,18 @@ def _load_interactive_slam_correction(map_path, config=None, tf_buffer=None):
     the original bag TF at the frame reference time so the resulting delta also
     includes an optional planar constraint applied before Interactive SLAM.
     The accumulated frame point clouds themselves are not used here.
+
+    未做 Interactive SLAM 时返回恒等修正，让调用方直接使用原始 odom 位姿。
     """
     frame_dir = Path(map_path) / "frame"
     corrected_dir = Path(map_path) / "interactive_slam" / "corrected"
     timestamps_path = frame_dir / "timestamps.txt"
 
     if not corrected_dir.is_dir() or not any(corrected_dir.iterdir()):
-        raise RuntimeError(
-            "未找到 Interactive SLAM corrected 结果。请先完成位姿修正和插值回填。"
+        console.print(
+            "[dim]未检测到 Interactive SLAM 修正结果，直接使用原始 odom 位姿。[/dim]"
         )
+        return _identity_correction()
     if not timestamps_path.exists():
         raise RuntimeError(
             "缺少 frame/timestamps.txt，无法将修正轨迹与 bag 扫描按时间对齐。"
@@ -367,6 +383,8 @@ def _load_interactive_slam_correction(map_path, config=None, tf_buffer=None):
     translations = np.asarray([delta[:3, 3] for delta in deltas], dtype=np.float64)
     rotations = R.from_matrix(np.asarray([delta[:3, :3] for delta in deltas]))
     return {
+        "identity": False,
+        "pose_source": "interactive_slam_corrected",
         "times": times,
         "translations": translations,
         "rotations": rotations,
@@ -377,6 +395,8 @@ def _load_interactive_slam_correction(map_path, config=None, tf_buffer=None):
 
 def _apply_interactive_slam_correction(raw_pose, timestamp, correction):
     """Apply the time-interpolated frame correction to one raw bag pose."""
+    if correction.get("identity"):
+        return raw_pose
     times = correction["times"]
     translations = correction["translations"]
     rotations = correction["rotations"]
@@ -403,11 +423,11 @@ def _apply_interactive_slam_correction(raw_pose, timestamp, correction):
 
 
 def convert_bag_to_kitti(map_path, config):
-    """从 bag 逐扫描点云和 Interactive SLAM 修正轨迹生成 KITTI。
+    """从 bag 逐扫描点云和 frame/ 位姿轨迹生成 KITTI。
 
     写出的 velodyne/*.bin 必须是 base_link 局部帧；如果输入点云是 /cloud_registered
-    这类 odom/global 点云，会先用原始 TF 还原到局部帧。输出轨迹则使用按时间插值后的
-    Interactive SLAM 修正位姿，不能用修正位姿反变换原始 registered 点云。
+    这类 odom/global 点云，会先用原始 TF 还原到局部帧。输出轨迹优先使用按时间插值后的
+    Interactive SLAM 修正位姿，未做修正时直接使用原始 odom 位姿。
     """
     if rosbag2_py is None:
         raise RuntimeError("无法导入 rosbag2_py。请在 ROS2 环境中运行 ERASOR2 转换。")
@@ -430,7 +450,8 @@ def convert_bag_to_kitti(map_path, config):
     if not timestamps_path.exists():
         _reconstruct_legacy_frame_timestamps(map_path, config)
     correction = _load_interactive_slam_correction(map_path, config, tf_buffer)
-    print(f"  pose_source=interactive_slam_corrected, 控制点={correction['count']}")
+    pose_source = correction.get("pose_source", "interactive_slam_corrected")
+    print(f"  pose_source={pose_source}, 控制点={correction['count']}")
 
     kitti_root = os.path.join(map_path, "erasor2_dataset")
     seq_dir = os.path.join(kitti_root, "dataset", "sequences", "00")
@@ -529,12 +550,12 @@ def convert_bag_to_kitti(map_path, config):
         f"source_cloud_frame: {first_cloud_frame}\n"
         f"time_source: {','.join(sorted(time_sources))}\n"
         f"point_transform: {first_cloud_frame} -> {fixed_frame} -> {base_link_frame}\n"
-        "pose_source: interactive_slam_corrected\n"
+        f"pose_source: {pose_source}\n"
         f"correction_control_points: {correction['count']}\n"
         f"frames_written: {frame_count}\n"
         f"max_points_per_frame: {max_points}\n"
         "poses_suma_optim.txt is compensated for ERASOR2 SemanticKITTILoader.\n"
-        "poses_odom_base.txt contains Interactive SLAM-corrected odom -> base_link matrices.\n"
+        "poses_odom_base.txt contains odom -> base_link matrices (raw or Interactive SLAM-corrected).\n"
         "labels/*.label are zero placeholders for size compatibility, not ground truth.\n"
     )
 
