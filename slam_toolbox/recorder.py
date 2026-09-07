@@ -105,7 +105,7 @@ def start_recording(map_path, config=None):
     base_link_frame = cfg["base_link_frame"]
 
     bag_dir = os.path.join(map_path, "bag")
-    output_bag = os.path.join(bag_dir, "bag")
+    os.makedirs(bag_dir, exist_ok=True)
 
     # 1. 启动监控节点
     rclpy.init()
@@ -117,7 +117,7 @@ def start_recording(map_path, config=None):
 
     # 2. 启动 ros2 bag 录制子进程 — 话题来自 config
     topics = [pointcloud_topic, "/Odometry", "/tf", "/tf_static"]
-    cmd = ["ros2", "bag", "record", "-o", output_bag] + topics
+    cmd = ["ros2", "bag", "record", "-o", bag_dir] + topics
 
     console.print(f"[dim]执行命令: {' '.join(cmd)}[/dim]")
     proc = subprocess.Popen(

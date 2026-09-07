@@ -403,7 +403,9 @@ def start_extraction(map_path, config=None):
         console.print(f"[red]未在 {bag_dir} 下找到 .db3 或 .mcap。[/red]")
         return
 
-    storage_options = rosbag2_py.StorageOptions(uri=bag_dir, storage_id="sqlite3")
+    storage_options = rosbag2_py.StorageOptions(
+        uri=os.path.dirname(db_file), storage_id="sqlite3"
+    )
     converter_options = rosbag2_py.ConverterOptions(
         input_serialization_format="cdr",
         output_serialization_format="cdr",

@@ -115,9 +115,9 @@ def _find_bag_storage(map_path):
     for root, _, files in os.walk(bag_dir):
         for name in files:
             if name.endswith(".db3"):
-                return bag_dir, "sqlite3", os.path.join(root, name)
+                return root, "sqlite3", os.path.join(root, name)
             if name.endswith(".mcap"):
-                return bag_dir, "mcap", os.path.join(root, name)
+                return root, "mcap", os.path.join(root, name)
     raise FileNotFoundError(f"未在 {bag_dir} 下找到 .db3 或 .mcap")
 
 
